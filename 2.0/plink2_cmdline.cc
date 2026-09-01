@@ -3270,6 +3270,23 @@ PglErr CmdlineParsePhase1(const char* ver_str, const char* ver_str2, const char*
       reterr = kPglRetHelp;
       goto CmdlineParsePhase1_ret_1;
     }
+    if (!flag_ct) {
+      // No flags at all.  Print what "-h" prints -- version, usage, command list -- rather than
+      // starting a run that ends in "Warning: No output requested.  Exiting."  A user who types
+      // the program's name with nothing after it is asking what it does, and every other tool in
+      // a pipeline (samtools, bcftools, salmon, bwa) answers that question here.
+      //
+      // A named flag is still required for real work: this branch fires only when the command line
+      // carries no flag, so "--script" expansion and "--rerun" are unaffected, both having set
+      // flags of their own by this point.
+      fputs(ver_str, stdout);
+      fputs(ver_str2, stdout);
+      fputs(cmdline_format_str, stdout);
+      fputs(notestr_null_calc2, stdout);
+      fputs(errstr_append, stdout);
+      reterr = kPglRetHelp;
+      goto CmdlineParsePhase1_ret_1;
+    }
     if (silent_present) {
       if (unlikely(!freopen(NULL_STREAM_NAME, "w", stdout))) {
         fputs("Warning: --silent failed.", stderr);

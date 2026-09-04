@@ -224,7 +224,9 @@ FLAGSET64_DEF_START()
   kfCommand1Vcor = (1 << 29),
   kfCommand1PhenoSvd = (1 << 30),
   kfCommand1CheckOrImputeSex = (1U << 31),
-  kfCommand1MendelReport = (1LLU << 32)
+  kfCommand1MendelReport = (1LLU << 32),
+  kfCommand1LdScore = (1LLU << 33),
+  kfCommand1ShowTags = (1LLU << 34)
 FLAGSET64_DEF_END(Command1Flags);
 
 void PgenInfoPrint(const char* pgenname, const PgenFileInfo* pgfip, PgenExtensionLl* header_exts, PgenHeaderCtrl header_ctrl, uint32_t max_allele_ct) {
@@ -421,6 +423,8 @@ typedef struct Plink2CmdlineStruct {
   GwasSsfInfo gwas_ssf_info;
   ClumpInfo clump_info;
   VcorInfo vcor_info;
+  LdScoreInfo ld_score_info;
+  TagInfo tag_info;
   PhenoSvdInfo pheno_svd_info;
   CheckSexInfo check_sex_info;
   MendelInfo mendel_info;
@@ -555,7 +559,7 @@ typedef struct Plink2CmdlineStruct {
 
 // er, probably time to just always initialize this...
 uint32_t SingleVariantLoaderIsNeeded(const char* king_cutoff_fprefix, Command1Flags command_flags1, MakePlink2Flags make_plink2_flags, RmDupMode rmdup_mode, double hwe_ln_thresh) {
-  return (command_flags1 & (kfCommand1Exportf | kfCommand1MakeKing | kfCommand1GenoCounts | kfCommand1LdPrune | kfCommand1Validate | kfCommand1Pca | kfCommand1MakeRel | kfCommand1Glm | kfCommand1Score | kfCommand1Ld | kfCommand1Hardy | kfCommand1Sdiff | kfCommand1PgenDiff | kfCommand1Clump | kfCommand1Vcor)) ||
+  return (command_flags1 & (kfCommand1Exportf | kfCommand1MakeKing | kfCommand1GenoCounts | kfCommand1LdPrune | kfCommand1Validate | kfCommand1Pca | kfCommand1MakeRel | kfCommand1Glm | kfCommand1Score | kfCommand1Ld | kfCommand1Hardy | kfCommand1Sdiff | kfCommand1PgenDiff | kfCommand1Clump | kfCommand1Vcor | kfCommand1LdScore | kfCommand1ShowTags)) ||
     ((command_flags1 & kfCommand1MakePlink2) && (make_plink2_flags & kfMakePgen)) ||
     ((command_flags1 & kfCommand1KingCutoff) && (!king_cutoff_fprefix)) ||
     (rmdup_mode != kRmDup0) ||
@@ -575,7 +579,7 @@ uint32_t DecentAlleleFreqsAreNeeded(Command1Flags command_flags1, CheckSexFlags 
 // variants are retained, but let's keep this simpler for now
 uint32_t MajAllelesAreNeeded(Command1Flags command_flags1, PcaFlags pca_flags, GlmFlags glm_flags, VcorFlags vcor_flags) {
   // Keep this in sync with --error-on-freq-calc.
-  return (command_flags1 & (kfCommand1LdPrune | kfCommand1Ld)) ||
+  return (command_flags1 & (kfCommand1LdPrune | kfCommand1Ld | kfCommand1LdScore)) ||
     ((command_flags1 & kfCommand1Pca) && (pca_flags & kfPcaBiallelicVarWts)) ||
     ((command_flags1 & kfCommand1Glm) && (!(glm_flags & kfGlmOmitRef))) ||
     ((command_flags1 & kfCommand1Vcor) && ((!(vcor_flags & kfVcorRefBased)) || (vcor_flags & (kfVcorColMaj | kfVcorColNonmaj))));
@@ -2133,6 +2137,10 @@ PglErr Plink2Core(const Plink2Cmdline* pcp, MakePlink2Flags make_plink2_flags, c
             goto Plink2Core_ret_NOMEM;
           }
         }
+        if ((sample_ct != founder_ct) && (pcp->command_flags1 & kfCommand1LdScore) && (!nonfounders) && (!(pcp->ld_score_info.flags & kfLdScoreFounders))) {
+          logerrputs("Error: --ld-score specified, but with neither --ld-score-founders nor\n--nonfounders; and nonfounders are present.\n");
+          goto Plink2Core_ret_INCONSISTENT_INPUT;
+        }
         if ((sample_ct != founder_ct) && (pcp->min_allele_ddosage || (pcp->max_allele_ddosage != (~0LLU)) || ((!pcp->read_freq_fname) && (pcp->freq_rpt_flags & kfAlleleFreqCounts))) && (!nonfounders) && (!(pcp->misc_flags & kfMiscAcFounders))) {
           logerrputs("Error: --mac/--max-mac/\"--freq counts\" specified, but with neither\n--ac-founders nor --nonfounders; and nonfounders are present.\n");
           goto Plink2Core_ret_INCONSISTENT_INPUT;
@@ -2974,6 +2982,17 @@ PglErr Plink2Core(const Plink2Cmdline* pcp, MakePlink2Flags make_plink2_flags, c
         }
       }
 
+      if (pcp->command_flags1 & kfCommand1ShowTags) {
+        if (unlikely(vpos_sortstatus & kfUnsortedVarBp)) {
+          logerrputs("Error: --show-tags requires a sorted .pvar/.bim.  Retry this command after\nusing --make-pgen/--make-bed + --sort-vars to sort your data.\n");
+          return kPglRetInconsistentInput;
+        }
+        reterr = ShowTags(variant_include, cip, variant_bps, variant_ids, allele_idx_offsets, founder_info, pcp->tag_info.tag_fname, pcp->tag_info.list_all, pcp->tag_info.mode2, pcp->tag_info.bp_radius, pcp->tag_info.r2_thresh, raw_variant_ct, variant_ct, raw_sample_ct, founder_ct, max_variant_id_slen, pcp->tag_info.output_zst, pcp->max_thread_ct, &simple_pgr, outname, outname_end);
+        if (unlikely(reterr)) {
+          goto Plink2Core_ret_1;
+        }
+      }
+
       if (pcp->command_flags1 & kfCommand1Vcor) {
         if (unlikely(vpos_sortstatus & kfUnsortedVarBp)) {
           logerrputs("Error: --r[2]-[un]phased runs require a sorted .pvar/.bim.  Retry this command\nafter using --make-pgen/--make-bed + --sort-vars to sort your data.\n");
@@ -2984,6 +3003,25 @@ PglErr Plink2Core(const Plink2Cmdline* pcp, MakePlink2Flags make_plink2_flags, c
           return kPglRetInconsistentInput;
         }
         reterr = Vcor(variant_include, cip, variant_bps, variant_ids, variant_cms, allele_idx_offsets, allele_storage, maj_alleles, allele_freqs, founder_info, sex_nm, sex_male, &(pcp->vcor_info), raw_variant_ct, variant_ct, raw_sample_ct, founder_ct, max_variant_id_slen, max_allele_slen, pcp->parallel_idx, pcp->parallel_tot, pcp->max_thread_ct, &simple_pgr, outname, outname_end);
+        if (unlikely(reterr)) {
+          goto Plink2Core_ret_1;
+        }
+      }
+
+      if (pcp->command_flags1 & kfCommand1LdScore) {
+        if (unlikely(vpos_sortstatus & kfUnsortedVarBp)) {
+          logerrputs("Error: --ld-score requires a sorted .pvar/.bim.  Retry this command after using\n--make-pgen/--make-bed + --sort-vars to sort your data.\n");
+          return kPglRetInconsistentInput;
+        }
+        if (unlikely((vpos_sortstatus & kfUnsortedVarCm) && (pcp->ld_score_info.cm_radius >= 0.0))) {
+          logerrputs("Error: --ld-score's cM window requires nondecreasing CM values on each\nchromosome.  Retry this command after regenerating your CM coordinates.\n");
+          return kPglRetInconsistentInput;
+        }
+        // --nonfounders widens the sample set; --ld-score-founders is the
+        // explicit opt-in to the founders-only default, mirroring
+        // --ac-founders.
+        const uint32_t ldsc_use_all = (pcp->misc_flags / kfMiscNonfounders) & 1;
+        reterr = LdScore(variant_include, cip, variant_bps, variant_ids, variant_cms, allele_idx_offsets, maj_alleles, ldsc_use_all? sample_include : founder_info, &(pcp->ld_score_info), raw_variant_ct, variant_ct, raw_sample_ct, ldsc_use_all? sample_ct : founder_ct, pcp->max_thread_ct, &simple_pgr, outname, outname_end);
         if (unlikely(reterr)) {
           goto Plink2Core_ret_1;
         }
@@ -3760,6 +3798,8 @@ int main(int argc, char** argv) {
   InitGwasSsf(&pc.gwas_ssf_info);
   InitClump(&pc.clump_info);
   InitVcor(&pc.vcor_info);
+  InitLdScore(&pc.ld_score_info);
+  InitTag(&pc.tag_info);
   InitPhenoSvd(&pc.pheno_svd_info);
   InitCheckSex(&pc.check_sex_info);
   InitMendel(&pc.mendel_info);
@@ -8074,6 +8114,80 @@ int main(int argc, char** argv) {
             pc.vcor_info.bp_radius = S_CAST(int32_t, dxx);
           }
           r2_required = 1;
+        } else if (strequal_k_unsafe(flagname_p2, "d-score-founders")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 0, 0))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          pc.ld_score_info.flags |= kfLdScoreFounders;
+        } else if (strequal_k_unsafe(flagname_p2, "d-score")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 0, 3))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          for (uint32_t param_idx = 1; param_idx <= param_ct; ++param_idx) {
+            const char* cur_modif = argvk[arg_idx + param_idx];
+            const uint32_t cur_modif_slen = strlen(cur_modif);
+            if (strequal_k(cur_modif, "zs", cur_modif_slen)) {
+              pc.ld_score_info.flags |= kfLdScoreZs;
+            } else if (strequal_k(cur_modif, "multiallelic", cur_modif_slen)) {
+              pc.ld_score_info.flags |= kfLdScoreMultiallelic;
+            } else if (likely(StrStartsWith(cur_modif, "cols=", cur_modif_slen))) {
+              if (unlikely(pc.ld_score_info.flags & kfLdScoreColAll)) {
+                logerrputs("Error: Multiple --ld-score cols= modifiers.\n");
+                goto main_ret_INVALID_CMDLINE;
+              }
+              reterr = ParseColDescriptor(&(cur_modif[5]), "chrom\0pos\0nobsi\0l2\0", "ld-score", kfLdScoreColChrom, kfLdScoreColDefault, 1, &pc.ld_score_info.flags);
+              if (unlikely(reterr)) {
+                goto main_ret_1;
+              }
+            } else {
+              snprintf(g_logbuf, kLogbufSize, "Error: Invalid --ld-score argument '%s'.\n", cur_modif);
+              goto main_ret_INVALID_CMDLINE_WWA;
+            }
+          }
+          if (!(pc.ld_score_info.flags & kfLdScoreColAll)) {
+            pc.ld_score_info.flags |= kfLdScoreColDefault;
+          }
+          pc.command_flags1 |= kfCommand1LdScore;
+          pc.dependency_flags |= kfFilterAllReq;
+        } else if (strequal_k_unsafe(flagname_p2, "d-score-window")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          uint32_t uii;
+          if (unlikely(ScanUintCappedx(argvk[arg_idx + 1], 0x7ffffffe, &uii))) {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid --ld-score-window argument '%s'.\n", argvk[arg_idx + 1]);
+            goto main_ret_INVALID_CMDLINE_WWA;
+          }
+          pc.ld_score_info.var_ct_radius = uii;
+          // An explicit window replaces the cM default rather than adding to
+          // it; otherwise a user asking for a variant-count window would
+          // silently keep getting the 1 cM restriction too.
+          if (pc.ld_score_info.cm_radius == 1.0) {
+            pc.ld_score_info.cm_radius = -1.0;
+          }
+        } else if (strequal_k_unsafe(flagname_p2, "d-score-window-kb")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          double dxx;
+          if (unlikely((!ScantokDouble(argvk[arg_idx + 1], &dxx)) || (dxx < 0) || (dxx > 2147483.646))) {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid --ld-score-window-kb argument '%s'.\n", argvk[arg_idx + 1]);
+            goto main_ret_INVALID_CMDLINE_WWA;
+          }
+          pc.ld_score_info.bp_radius = S_CAST(int32_t, dxx * 1000 * (1 + kSmallEpsilon));
+          if (pc.ld_score_info.cm_radius == 1.0) {
+            pc.ld_score_info.cm_radius = -1.0;
+          }
+        } else if (strequal_k_unsafe(flagname_p2, "d-score-window-cm")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          double dxx;
+          if (unlikely((!ScantokDouble(argvk[arg_idx + 1], &dxx)) || (dxx < 0))) {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid --ld-score-window-cm argument '%s'.\n", argvk[arg_idx + 1]);
+            goto main_ret_INVALID_CMDLINE_WWA;
+          }
+          pc.ld_score_info.cm_radius = dxx * (1 + kSmallEpsilon);
         } else if (strequal_k_unsafe(flagname_p2, "d-window-cm")) {
           if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
             goto main_ret_INVALID_CMDLINE_2A;
@@ -8166,6 +8280,11 @@ int main(int argc, char** argv) {
         } else if (strequal_k_unsafe(flagname_p2, "oop-assoc")) {
           logerrputs("Error: --loop-assoc is retired.  Use --within + --split-cat-pheno instead.\n");
           goto main_ret_INVALID_CMDLINE_A;
+        } else if (strequal_k_unsafe(flagname_p2, "ist-all")) {
+          // Checked after the parse loop, since flags are processed in
+          // alphabetical order and --show-tags comes later.
+          pc.tag_info.list_all = 1;
+          goto main_param_zero;
         } else if (strequal_k_unsafe(flagname_p2, "ist-duplicate-vars")) {
           logerrputs("Error: --list-duplicate-vars is retired.  We recommend --set-all-var-ids +\n--rm-dup for variant deduplication.\n");
           goto main_ret_INVALID_CMDLINE_A;
@@ -11395,7 +11514,31 @@ int main(int argc, char** argv) {
         break;
 
       case 's':
-        if (strequal_k_unsafe(flagname_p2, "eed")) {
+        if (strequal_k_unsafe(flagname_p2, "how-tags")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 2))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          uint32_t fname_param_idx = 1;
+          if (param_ct == 2) {
+            if (strequal_k_unsafe(argvk[arg_idx + 1], "zs")) {
+              pc.tag_info.output_zst = 1;
+              fname_param_idx = 2;
+            } else if (likely(strequal_k_unsafe(argvk[arg_idx + 2], "zs"))) {
+              pc.tag_info.output_zst = 1;
+            } else {
+              logerrputs("Error: Invalid --show-tags argument sequence.\n");
+              goto main_ret_INVALID_CMDLINE_A;
+            }
+          }
+          if (!strequal_k_unsafe(argvk[arg_idx + fname_param_idx], "all")) {
+            reterr = AllocFname(argvk[arg_idx + fname_param_idx], flagname_p, &pc.tag_info.tag_fname);
+            if (unlikely(reterr)) {
+              goto main_ret_1;
+            }
+          }
+          pc.command_flags1 |= kfCommand1ShowTags;
+          pc.dependency_flags |= kfFilterAllReq;
+        } else if (strequal_k_unsafe(flagname_p2, "eed")) {
           if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 0x7fffffff))) {
             goto main_ret_INVALID_CMDLINE_2A;
           }
@@ -12086,7 +12229,32 @@ int main(int argc, char** argv) {
         break;
 
       case 't':
-        if (strequal_k_unsafe(flagname_p2, "hreads")) {
+        if (strequal_k_unsafe(flagname_p2, "ag-kb")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          double dxx;
+          if (unlikely((!ScantokDouble(argvk[arg_idx + 1], &dxx)) || (dxx < 0) || (dxx > 2147483.646))) {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid --tag-kb argument '%s'.\n", argvk[arg_idx + 1]);
+            goto main_ret_INVALID_CMDLINE_WWA;
+          }
+          pc.tag_info.bp_radius = S_CAST(int32_t, dxx * 1000 * (1 + kSmallEpsilon));
+        } else if (strequal_k_unsafe(flagname_p2, "ag-mode2")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 0, 0))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          pc.tag_info.mode2 = 1;
+        } else if (strequal_k_unsafe(flagname_p2, "ag-r2")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          double dxx;
+          if (unlikely((!ScantokDouble(argvk[arg_idx + 1], &dxx)) || (dxx < 0.0) || (dxx > 1.0))) {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid --tag-r2 argument '%s'.\n", argvk[arg_idx + 1]);
+            goto main_ret_INVALID_CMDLINE_WWA;
+          }
+          pc.tag_info.r2_thresh = dxx * (1 - kSmallEpsilon);
+        } else if (strequal_k_unsafe(flagname_p2, "hreads")) {
           if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
             goto main_ret_INVALID_CMDLINE_2A;
           }
@@ -12945,6 +13113,20 @@ int main(int argc, char** argv) {
         }
       }
     } while ((++cur_flag_idx) < flag_ct);
+    if (unlikely(pc.tag_info.list_all && (!(pc.command_flags1 & kfCommand1ShowTags)))) {
+      logerrputs("Error: --list-all must be used with --show-tags.\n");
+      goto main_ret_INVALID_CMDLINE_A;
+    }
+    if (pc.tag_info.mode2) {
+      if (unlikely(!(pc.command_flags1 & kfCommand1ShowTags))) {
+        logerrputs("Error: --tag-mode2 must be used with --show-tags.\n");
+        goto main_ret_INVALID_CMDLINE_A;
+      }
+      if (unlikely(!pc.tag_info.tag_fname)) {
+        logerrputs("Error: --tag-mode2 cannot be used with \"--show-tags all\".\n");
+        goto main_ret_INVALID_CMDLINE_A;
+      }
+    }
     if (!outname_end) {
       outname_end = &(outname[6]);
     } else if (!allow_misleading_out_arg) {
@@ -13683,6 +13865,7 @@ int main(int argc, char** argv) {
   CleanupFlip(&pc.flip_info);
   CleanupPermConfig(&pc.perm_config);
   CleanupVcor(&pc.vcor_info);
+  CleanupTag(&pc.tag_info);
   CleanupClump(&pc.clump_info);
   CleanupGwasSsf(&pc.gwas_ssf_info);
   CleanupExportf(&pc.exportf_info);

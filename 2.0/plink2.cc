@@ -227,7 +227,9 @@ FLAGSET64_DEF_START()
   kfCommand1MendelReport = (1LLU << 32),
   kfCommand1LdScore = (1LLU << 33),
   kfCommand1ShowTags = (1LLU << 34),
-  kfCommand1Twolocus = (1LLU << 35)
+  kfCommand1Twolocus = (1LLU << 35),
+  kfCommand1Blocks = (1LLU << 36),
+  kfCommand1TestMishap = (1LLU << 37)
 FLAGSET64_DEF_END(Command1Flags);
 
 void PgenInfoPrint(const char* pgenname, const PgenFileInfo* pgfip, PgenExtensionLl* header_exts, PgenHeaderCtrl header_ctrl, uint32_t max_allele_ct) {
@@ -427,6 +429,8 @@ typedef struct Plink2CmdlineStruct {
   LdScoreInfo ld_score_info;
   TagInfo tag_info;
   TwolocusInfo twolocus_info;
+  BlocksInfo blocks_info;
+  TestMishapFlags test_mishap_flags;
   PhenoSvdInfo pheno_svd_info;
   CheckSexInfo check_sex_info;
   MendelInfo mendel_info;
@@ -561,7 +565,7 @@ typedef struct Plink2CmdlineStruct {
 
 // er, probably time to just always initialize this...
 uint32_t SingleVariantLoaderIsNeeded(const char* king_cutoff_fprefix, Command1Flags command_flags1, MakePlink2Flags make_plink2_flags, RmDupMode rmdup_mode, double hwe_ln_thresh) {
-  return (command_flags1 & (kfCommand1Exportf | kfCommand1MakeKing | kfCommand1GenoCounts | kfCommand1LdPrune | kfCommand1Validate | kfCommand1Pca | kfCommand1MakeRel | kfCommand1Glm | kfCommand1Score | kfCommand1Ld | kfCommand1Hardy | kfCommand1Sdiff | kfCommand1PgenDiff | kfCommand1Clump | kfCommand1Vcor | kfCommand1LdScore | kfCommand1ShowTags | kfCommand1Twolocus)) ||
+  return (command_flags1 & (kfCommand1Exportf | kfCommand1MakeKing | kfCommand1GenoCounts | kfCommand1LdPrune | kfCommand1Validate | kfCommand1Pca | kfCommand1MakeRel | kfCommand1Glm | kfCommand1Score | kfCommand1Ld | kfCommand1Hardy | kfCommand1Sdiff | kfCommand1PgenDiff | kfCommand1Clump | kfCommand1Vcor | kfCommand1LdScore | kfCommand1ShowTags | kfCommand1Twolocus | kfCommand1Blocks | kfCommand1TestMishap)) ||
     ((command_flags1 & kfCommand1MakePlink2) && (make_plink2_flags & kfMakePgen)) ||
     ((command_flags1 & kfCommand1KingCutoff) && (!king_cutoff_fprefix)) ||
     (rmdup_mode != kRmDup0) ||
@@ -581,7 +585,7 @@ uint32_t DecentAlleleFreqsAreNeeded(Command1Flags command_flags1, CheckSexFlags 
 // variants are retained, but let's keep this simpler for now
 uint32_t MajAllelesAreNeeded(Command1Flags command_flags1, PcaFlags pca_flags, GlmFlags glm_flags, VcorFlags vcor_flags) {
   // Keep this in sync with --error-on-freq-calc.
-  return (command_flags1 & (kfCommand1LdPrune | kfCommand1Ld | kfCommand1LdScore)) ||
+  return (command_flags1 & (kfCommand1LdPrune | kfCommand1Ld | kfCommand1LdScore | kfCommand1TestMishap)) ||
     ((command_flags1 & kfCommand1Pca) && (pca_flags & kfPcaBiallelicVarWts)) ||
     ((command_flags1 & kfCommand1Glm) && (!(glm_flags & kfGlmOmitRef))) ||
     ((command_flags1 & kfCommand1Vcor) && ((!(vcor_flags & kfVcorRefBased)) || (vcor_flags & (kfVcorColMaj | kfVcorColNonmaj))));
@@ -591,6 +595,10 @@ uint32_t MajAllelesAreNeeded(Command1Flags command_flags1, PcaFlags pca_flags, G
 // MajAllelesAreNeeded()
 uint32_t IndecentAlleleFreqsAreNeeded(Command1Flags command_flags1, VcorFlags vcor_flags, double min_maf, double max_maf) {
   // Keep this in sync with --error-on-freq-calc.
+  if (command_flags1 & kfCommand1Blocks) {
+    // --blocks applies a MAF floor of its own.
+    return 1;
+  }
   // Vscore could go either here or in the decent bucket
   return (command_flags1 & kfCommand1Vscore) ||
     ((command_flags1 & kfCommand1Vcor) && (vcor_flags & kfVcorColFreq)) ||
@@ -2995,8 +3003,30 @@ PglErr Plink2Core(const Plink2Cmdline* pcp, MakePlink2Flags make_plink2_flags, c
         }
       }
 
+      if (pcp->command_flags1 & kfCommand1Blocks) {
+        if (unlikely(vpos_sortstatus & kfUnsortedVarBp)) {
+          logerrputs("Error: --blocks requires a sorted .pvar/.bim.  Retry this command after using\n--make-pgen/--make-bed + --sort-vars to sort your data.\n");
+          return kPglRetInconsistentInput;
+        }
+        reterr = HaploviewBlocks(variant_include, cip, variant_bps, variant_ids, allele_idx_offsets, allele_freqs, founder_info, pheno_cols, &(pcp->blocks_info), raw_sample_ct, raw_variant_ct, variant_ct, pheno_ct, pcp->max_thread_ct, &simple_pgr, outname, outname_end);
+        if (unlikely(reterr)) {
+          goto Plink2Core_ret_1;
+        }
+      }
+
       if (pcp->command_flags1 & kfCommand1Twolocus) {
         reterr = TwolocusReport(sample_include, variant_include, variant_ids, allele_idx_offsets, allele_storage, pheno_cols, pheno_names, pcp->twolocus_info.mkr1, pcp->twolocus_info.mkr2, raw_sample_ct, sample_ct, variant_ct, pheno_ct, max_pheno_name_blen, pcp->twolocus_info.output_zst, pcp->max_thread_ct, &simple_pgr, outname, outname_end);
+        if (unlikely(reterr)) {
+          goto Plink2Core_ret_1;
+        }
+      }
+
+      if (pcp->command_flags1 & kfCommand1TestMishap) {
+        if (unlikely(vpos_sortstatus & kfUnsortedVarBp)) {
+          logerrputs("Error: --test-mishap requires a sorted .pvar/.bim.  Retry this command after\nusing --make-pgen/--make-bed + --sort-vars to sort your data.\n");
+          return kPglRetInconsistentInput;
+        }
+        reterr = TestMishap(variant_include, cip, variant_ids, allele_idx_offsets, maj_alleles, allele_storage, sample_include, pcp->test_mishap_flags, pcp->min_maf, pcp->output_min_ln, raw_sample_ct, sample_ct, raw_variant_ct, variant_ct, pcp->max_thread_ct, &simple_pgr, outname, outname_end);
         if (unlikely(reterr)) {
           goto Plink2Core_ret_1;
         }
@@ -3810,6 +3840,8 @@ int main(int argc, char** argv) {
   InitLdScore(&pc.ld_score_info);
   InitTag(&pc.tag_info);
   InitTwolocus(&pc.twolocus_info);
+  InitBlocks(&pc.blocks_info);
+    pc.test_mishap_flags = kfTestMishap0;
   InitPhenoSvd(&pc.pheno_svd_info);
   InitCheckSex(&pc.check_sex_info);
   InitMendel(&pc.mendel_info);
@@ -4628,7 +4660,103 @@ int main(int argc, char** argv) {
         break;
 
       case 'b':
-        if (strequal_k_unsafe(flagname_p2, "file")) {
+        if (strequal_k_unsafe(flagname_p2, "locks")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 0, 2))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          for (uint32_t param_idx = 1; param_idx <= param_ct; ++param_idx) {
+            const char* cur_modif = argvk[arg_idx + param_idx];
+            const uint32_t cur_modif_slen = strlen(cur_modif);
+            if (strequal_k(cur_modif, "no-pheno-req", cur_modif_slen)) {
+              pc.blocks_info.flags |= kfBlocksNoPhenoReq;
+            } else if (likely(strequal_k(cur_modif, "no-small-max-span", cur_modif_slen))) {
+              pc.blocks_info.flags |= kfBlocksNoSmallMaxSpan;
+            } else {
+              snprintf(g_logbuf, kLogbufSize, "Error: Invalid --blocks argument '%s'.\n", cur_modif);
+              goto main_ret_INVALID_CMDLINE_WWA;
+            }
+          }
+          pc.command_flags1 |= kfCommand1Blocks;
+          pc.dependency_flags |= kfFilterAllReq;
+        } else if (strequal_k_unsafe(flagname_p2, "locks-max-kb")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          double dxx;
+          if (unlikely((!ScantokDouble(argvk[arg_idx + 1], &dxx)) || (dxx < 0) || (dxx > 2147483.646))) {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid --blocks-max-kb argument '%s'.\n", argvk[arg_idx + 1]);
+            goto main_ret_INVALID_CMDLINE_WWA;
+          }
+          pc.blocks_info.max_bp = S_CAST(int32_t, dxx * 1000 * (1 + kSmallEpsilon));
+        } else if (strequal_k_unsafe(flagname_p2, "locks-min-maf")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          double dxx;
+          if (unlikely((!ScantokDouble(argvk[arg_idx + 1], &dxx)) || (dxx < 0.0) || (dxx >= 0.5))) {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid --blocks-min-maf argument '%s'.\n", argvk[arg_idx + 1]);
+            goto main_ret_INVALID_CMDLINE_WWA;
+          }
+          pc.blocks_info.min_maf = dxx;
+        } else if (strequal_k_unsafe(flagname_p2, "locks-inform-frac")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          double dxx;
+          if (unlikely((!ScantokDouble(argvk[arg_idx + 1], &dxx)) || (dxx <= 0.0) || (dxx > 1.0))) {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid --blocks-inform-frac argument '%s'.\n", argvk[arg_idx + 1]);
+            goto main_ret_INVALID_CMDLINE_WWA;
+          }
+          pc.blocks_info.inform_frac = dxx;
+        } else if (strequal_k_unsafe(flagname_p2, "locks-strong-lowci")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          double dxx;
+          if (unlikely((!ScantokDouble(argvk[arg_idx + 1], &dxx)) || (dxx <= 0.0) || (dxx > 1.0))) {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid --blocks-strong-lowci argument '%s'.\n", argvk[arg_idx + 1]);
+            goto main_ret_INVALID_CMDLINE_WWA;
+          }
+          pc.blocks_info.strong_lowci_outer = 2 + S_CAST(int32_t, (dxx - kSmallEpsilon) * 100);
+          pc.blocks_info.strong_lowci = 2 + S_CAST(int32_t, (dxx + kSmallEpsilon) * 100);
+          // The classification code indexes a fixed 83-entry table by these
+          // quantiles, so the bounds are load-bearing rather than advisory.
+          if (unlikely((pc.blocks_info.strong_lowci_outer < 52) || (pc.blocks_info.strong_lowci > 82))) {
+            logerrputs("Error: --blocks-strong-lowci parameter currently must be in (0.5, 0.81).\n");
+            goto main_ret_INVALID_CMDLINE;
+          }
+        } else if (strequal_k_unsafe(flagname_p2, "locks-strong-highci")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          double dxx;
+          if (unlikely((!ScantokDouble(argvk[arg_idx + 1], &dxx)) || (dxx <= 0.0) || (dxx > 1.0))) {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid --blocks-strong-highci argument '%s'.\n", argvk[arg_idx + 1]);
+            goto main_ret_INVALID_CMDLINE_WWA;
+          }
+          pc.blocks_info.strong_highci = S_CAST(int32_t, (dxx - kSmallEpsilon) * 100);
+          if (unlikely(pc.blocks_info.strong_highci < 83)) {
+            logerrputs("Error: --blocks-strong-highci parameter currently must be larger than 0.83.\n");
+            goto main_ret_INVALID_CMDLINE;
+          }
+        } else if (strequal_k_unsafe(flagname_p2, "locks-recomb-highci")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          double dxx;
+          if (unlikely((!ScantokDouble(argvk[arg_idx + 1], &dxx)) || (dxx <= 0.0) || (dxx > 1.0))) {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid --blocks-recomb-highci argument '%s'.\n", argvk[arg_idx + 1]);
+            goto main_ret_INVALID_CMDLINE_WWA;
+          }
+          {
+            const uint32_t raw_recomb_highci = S_CAST(int32_t, (dxx + kSmallEpsilon) * 100);
+            if (unlikely(raw_recomb_highci < 2)) {
+              logerrputs("Error: --blocks-recomb-highci parameter must be at least 0.02.\n");
+              goto main_ret_INVALID_CMDLINE;
+            }
+            pc.blocks_info.recomb_highci = raw_recomb_highci - 1;
+          }
+        } else if (strequal_k_unsafe(flagname_p2, "file")) {
           if (unlikely(xload)) {
             goto main_ret_INVALID_CMDLINE_INPUT_CONFLICT;
           }
@@ -12466,6 +12594,20 @@ int main(int argc, char** argv) {
           }
           memcpy(pgenname, fname, slen + 1);
           xload = kfXloadTped;
+        } else if (strequal_k_unsafe(flagname_p2, "est-mishap")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 0, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          if (param_ct) {
+            const char* cur_modif = argvk[arg_idx + 1];
+            if (unlikely(!strequal_k(cur_modif, "zs", strlen(cur_modif)))) {
+              logerrputs("Error: Invalid --test-mishap argument sequence.\n");
+              goto main_ret_INVALID_CMDLINE_A;
+            }
+            pc.test_mishap_flags |= kfTestMishapZs;
+          }
+          pc.command_flags1 |= kfCommand1TestMishap;
+          pc.filter_flags |= kfFilterAllReq;
         } else if (likely(strequal_k_unsafe(flagname_p2, "ests"))) {
           if (unlikely(!(pc.command_flags1 & kfCommand1Glm))) {
             logerrputs("Error: --tests must be used with --glm.\n");
@@ -13162,6 +13304,10 @@ int main(int argc, char** argv) {
         logerrputs("Error: --tag-mode2 cannot be used with \"--show-tags all\".\n");
         goto main_ret_INVALID_CMDLINE_A;
       }
+    }
+    if ((pc.command_flags1 & kfCommand1Blocks) && (pc.blocks_info.recomb_highci > pc.blocks_info.strong_highci)) {
+      logerrputs("Error: --blocks-recomb-highci value cannot be larger than\n--blocks-strong-highci value.\n");
+      goto main_ret_INVALID_CMDLINE_A;
     }
     if (!outname_end) {
       outname_end = &(outname[6]);

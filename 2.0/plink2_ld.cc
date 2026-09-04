@@ -1446,6 +1446,2590 @@ PglErr IndepPairwise(const uintptr_t* variant_include, const ChrInfo* cip, const
   return reterr;
 }
 
+// Ported from PLINK 1.9's plink_ld.c: calc_lnlike(), em_phase_hethet(),
+// calc_lnlike_quantile() and haploview_blocks_classify(), which implement
+// Haploview's reading of the Gabriel et al. (2002) block definition.  The
+// classification of a pair's D' confidence interval is what --blocks is built
+// on, and its early exits are what make it affordable, so this is a faithful
+// port rather than a reimplementation.
+static const double kSmallishEpsilonB = 0.00000000002910383045673370361328125;
+static const double kRecip2m53B = 0.00000000000000011102230246251565404236316680908203125;
+
+double BlocksCalcLnlike(double known11, double known12, double known21, double known22, double center_ct_d, double freq11, double freq12, double freq21, double freq22, double half_hethet_share, double freq11_incr) {
+  double lnlike;
+  freq11 += freq11_incr;
+  freq22 += freq11_incr;
+  freq12 += half_hethet_share - freq11_incr;
+  freq21 += half_hethet_share - freq11_incr;
+  lnlike = center_ct_d * log(freq11 * freq22 + freq12 * freq21);
+  if (known11 != 0.0) {
+    lnlike += known11 * log(freq11);
+  }
+  if (known12 != 0.0) {
+    lnlike += known12 * log(freq12);
+  }
+  if (known21 != 0.0) {
+    lnlike += known21 * log(freq21);
+  }
+  if (known22 != 0.0) {
+    lnlike += known22 * log(freq22);
+  }
+  return lnlike;
+}
+
+
+uint32_t BlocksEmPhaseHethet(double known11, double known12, double known21, double known22, uint32_t center_ct, double* freq1x_ptr, double* freq2x_ptr, double* freqx1_ptr, double* freqx2_ptr, double* freq11_ptr, uint32_t* onside_sol_ct_ptr) {
+  // Returns 1 if at least one SNP is monomorphic over all valid observations;
+  // returns 0 otherwise, and fills all frequencies using the maximum
+  // likelihood solution to the cubic equation.
+  // (We're discontinuing most use of EM phasing since better algorithms have
+  // been developed, but the two marker case is mathematically clean and fast
+  // enough that it'll probably remain useful as an input for some of those
+  // better algorithms...)
+  double center_ct_d = (int32_t)center_ct;
+  double twice_tot = known11 + known12 + known21 + known22 + 2 * center_ct_d;
+  uint32_t sol_start_idx = 0;
+  uint32_t sol_end_idx = 1;
+  STD_ARRAY_DECL(double, 3, solutions);
+  double twice_tot_recip;
+  double half_hethet_share;
+  double freq11;
+  double freq12;
+  double freq21;
+  double freq22;
+  double prod_1122;
+  double prod_1221;
+  double incr_1122;
+  double best_sol;
+  double best_lnlike;
+  double cur_lnlike;
+  double freq1x;
+  double freq2x;
+  double freqx1;
+  double freqx2;
+  double lbound;
+  double dxx;
+  uint32_t cur_sol_idx;
+  // shouldn't have to worry about subtractive cancellation problems here
+  if (twice_tot == 0.0) {
+    return 1;
+  }
+  twice_tot_recip = 1.0 / twice_tot;
+  freq11 = known11 * twice_tot_recip;
+  freq12 = known12 * twice_tot_recip;
+  freq21 = known21 * twice_tot_recip;
+  freq22 = known22 * twice_tot_recip;
+  prod_1122 = freq11 * freq22;
+  prod_1221 = freq12 * freq21;
+  half_hethet_share = center_ct_d * twice_tot_recip;
+  // the following four values should all be guaranteed nonzero except in the
+  // NAN case
+  freq1x = freq11 + freq12 + half_hethet_share;
+  freq2x = 1.0 - freq1x;
+  freqx1 = freq11 + freq21 + half_hethet_share;
+  freqx2 = 1.0 - freqx1;
+  if (center_ct) {
+    if ((prod_1122 != 0.0) || (prod_1221 != 0.0)) {
+      sol_end_idx = CubicRealRoots(0.5 * (freq11 + freq22 - freq12 - freq21 - 3 * half_hethet_share), 0.5 * (prod_1122 + prod_1221 + half_hethet_share * (freq12 + freq21 - freq11 - freq22 + half_hethet_share)), -0.5 * half_hethet_share * prod_1122, solutions);
+      while (sol_end_idx && (solutions[sol_end_idx - 1] > half_hethet_share + kSmallishEpsilonB)) {
+	sol_end_idx--;
+      }
+      while ((sol_start_idx < sol_end_idx) && (solutions[sol_start_idx] < -kSmallishEpsilonB)) {
+	sol_start_idx++;
+      }
+      if (sol_start_idx == sol_end_idx) {
+	// Lost a planet Master Obi-Wan has.  How embarrassing...
+	// lost root must be a double root at one of the boundary points, just
+	// check their likelihoods
+	sol_start_idx = 0;
+	sol_end_idx = 2;
+	solutions[0] = 0;
+	solutions[1] = half_hethet_share;
+      } else {
+	if (solutions[sol_start_idx] < 0) {
+	  solutions[sol_start_idx] = 0;
+	}
+	if (solutions[sol_end_idx - 1] > half_hethet_share) {
+	  solutions[sol_end_idx - 1] = half_hethet_share;
+	}
+      }
+    } else {
+      solutions[0] = 0;
+      // bugfix (6 Oct 2017): need to use all nonzero values here
+      const double nonzero_freq_xx = freq11 + freq22;
+      const double nonzero_freq_xy = freq12 + freq21;
+      if ((nonzero_freq_xx + kSmallishEpsilonB < half_hethet_share + nonzero_freq_xy) && (nonzero_freq_xy + kSmallishEpsilonB < half_hethet_share + nonzero_freq_xx)) {
+	sol_end_idx = 3;
+	solutions[1] = (half_hethet_share + nonzero_freq_xy - nonzero_freq_xx) * 0.5;
+	solutions[2] = half_hethet_share;
+      } else {
+	sol_end_idx = 2;
+	solutions[1] = half_hethet_share;
+      }
+    }
+    best_sol = solutions[sol_start_idx];
+    if (sol_end_idx > sol_start_idx + 1) {
+      // select largest log likelihood
+      best_lnlike = BlocksCalcLnlike(known11, known12, known21, known22, center_ct_d, freq11, freq12, freq21, freq22, half_hethet_share, best_sol);
+      cur_sol_idx = sol_start_idx + 1;
+      do {
+	incr_1122 = solutions[cur_sol_idx];
+        cur_lnlike = BlocksCalcLnlike(known11, known12, known21, known22, center_ct_d, freq11, freq12, freq21, freq22, half_hethet_share, incr_1122);
+	if (cur_lnlike > best_lnlike) {
+          cur_lnlike = best_lnlike;
+          best_sol = incr_1122;
+	}
+      } while (++cur_sol_idx < sol_end_idx);
+    }
+    if (onside_sol_ct_ptr && (sol_end_idx > sol_start_idx + 1)) {
+      if (freqx1 * freq1x >= freq11) {
+	dxx = freq1x * freqx1 - freq11;
+	if (dxx > half_hethet_share) {
+	  dxx = half_hethet_share;
+	}
+      } else {
+	dxx = 0.0;
+      }
+      // okay to NOT count suboptimal boundary points because they don't permit
+      // direction changes within the main interval
+      // this should exactly match HaploviewBlocksClassify()'s D sign check
+      if ((freq11 + best_sol) - freqx1 * freq1x >= 0.0) {
+	if (best_sol > dxx + kSmallishEpsilonB) {
+          lbound = dxx + kSmallishEpsilonB;
+	} else {
+	  lbound = dxx;
+	}
+	if (best_sol < half_hethet_share - kSmallishEpsilonB) {
+	  half_hethet_share -= kSmallishEpsilonB;
+	}
+      } else {
+	if (best_sol > kSmallishEpsilonB) {
+	  lbound = kSmallishEpsilonB;
+	} else {
+	  lbound = 0.0;
+	}
+	if (best_sol < dxx - kSmallishEpsilonB) {
+	  half_hethet_share = dxx - kSmallishEpsilonB;
+	} else {
+	  half_hethet_share = dxx;
+	}
+      }
+      for (cur_sol_idx = sol_start_idx; cur_sol_idx < sol_end_idx; cur_sol_idx++) {
+	if (solutions[cur_sol_idx] < lbound) {
+	  sol_start_idx++;
+	}
+	if (solutions[cur_sol_idx] > half_hethet_share) {
+	  break;
+	}
+      }
+      if (cur_sol_idx >= sol_start_idx + 2) {
+	*onside_sol_ct_ptr = cur_sol_idx - sol_start_idx;
+      }
+    }
+    freq11 += best_sol;
+  } else if ((prod_1122 == 0.0) && (prod_1221 == 0.0)) {
+    return 1;
+  }
+  *freq1x_ptr = freq1x;
+  *freq2x_ptr = freq2x;
+  *freqx1_ptr = freqx1;
+  *freqx2_ptr = freqx2;
+  *freq11_ptr = freq11;
+  return 0;
+}
+
+
+double BlocksCalcLnlikeQuantile(double known11, double known12, double known21, double known22, double unknown_dh, double freqx1, double freq1x, double freq2x, double freq11_expected, double denom, int32_t quantile) {
+  // almost identical to BlocksCalcLnlike, but we can skip the equal-to-zero checks
+  // when quantile isn't 100
+  double tmp11 = quantile * denom + freq11_expected;
+  double tmp12 = freq1x - tmp11;
+  double tmp21 = freqx1 - tmp11;
+  double tmp22 = freq2x - tmp21;
+  if (quantile == 100) {
+    // One of these values will be ~zero, and we want to ensure its logarithm
+    // is treated as a very negative number instead of nan.  May as well do it
+    // the same way as Haploview.
+    if (tmp11 < 1e-10) {
+      tmp11 = 1e-10;
+    }
+    if (tmp12 < 1e-10) {
+      tmp12 = 1e-10;
+    }
+    if (tmp21 < 1e-10) {
+      tmp21 = 1e-10;
+    }
+    if (tmp22 < 1e-10) {
+      tmp22 = 1e-10;
+    }
+  }
+  return known11 * log(tmp11) + known12 * log(tmp12) + known21 * log(tmp21) + known22 * log(tmp22) + unknown_dh * log(tmp11 * tmp22 + tmp12 * tmp21);
+}
+
+uint32_t HaploviewBlocksClassify(uint32_t* counts, uint32_t lowci_max, uint32_t lowci_min, uint32_t recomb_highci, uint32_t strong_highci, uint32_t strong_lowci, uint32_t strong_lowci_outer, uint32_t is_x, double recomb_fast_ln_thresh) {
+  // See comments in the middle of haploview_blocks().  The key insight is that
+  // we only need to classify the D' confidence intervals into a few types, and
+  // this almost never requires evaluation of all 101 log likelihoods.
+
+  // Note that lowCI and highCI are *one-sided* 95% confidence bounds, i.e.
+  // together, they form a 90% confidence interval.
+  double known11 = (double)(2 * counts[0] + counts[1] + counts[3]);
+  double known12 = (double)(2 * counts[2] + counts[1] + counts[5]);
+  double known21 = (double)(2 * counts[6] + counts[3] + counts[7]);
+  double known22 = (double)(2 * counts[8] + counts[5] + counts[7]);
+  double total_prob = 0.0;
+  double lnsurf_highstrong_thresh = 0.0;
+  uint32_t onside_sol_ct = 1;
+  double right_sum[83];
+  double freq1x;
+  double freq2x;
+  double freqx1;
+  double freqx2;
+  double freq11_expected;
+  double unknown_dh;
+  double denom;
+  double lnlike1;
+  double lnsurf_highindiff_thresh;
+  double dxx;
+  double dyy;
+  double dzz;
+  uint32_t quantile;
+  uint32_t center;
+  if (is_x) {
+    known11 -= (double)((int32_t)counts[9]);
+    known12 -= (double)((int32_t)counts[11]);
+    known21 -= (double)((int32_t)counts[12]);
+    known22 -= (double)((int32_t)counts[14]);
+  }
+  if (BlocksEmPhaseHethet(known11, known12, known21, known22, counts[4], &freq1x, &freq2x, &freqx1, &freqx2, &dzz, &onside_sol_ct)) {
+    return 1;
+  }
+  freq11_expected = freqx1 * freq1x;
+  dxx = dzz - freq11_expected;
+  if (dxx < 0.0) {
+    // D < 0, flip (1,1)<->(1,2) and (2,1)<->(2,2) to make D positive
+    dyy = known11;
+    known11 = known12;
+    known12 = dyy;
+    dyy = known21;
+    known21 = known22;
+    known22 = dyy;
+    freq11_expected = freqx2 * freq1x;
+    dyy = freqx1;
+    freqx1 = freqx2;
+    freqx2 = dyy;
+    dxx = -dxx;
+  }
+  dyy = MINV(freqx1 * freq2x, freqx2 * freq1x);
+  // this will always be in a term with a 0.01 multiplier from now on, so may
+  // as well premultiply.
+  denom = 0.01 * dyy;
+  unknown_dh = (double)((int32_t)counts[4]);
+
+  // force this to an actual likelihood array entry, so we know for sure
+  // total_prob >= 1.0 and can use that inequality for both early exit and
+  // determining the "futility threshold" (terms smaller than 2^{-53} / 19 are
+  // too small to matter).
+  center = (int32_t)(((dxx / dyy) * 100) + 0.5);
+
+  lnlike1 = BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, center);
+
+  // Previously assumed log likelihood was always concave, and used geometric
+  // series bounds... then I realized this was NOT a safe assumption to make.
+  // See e.g. rs9435793 and rs7531410 in 1000 Genomes phase 1.
+  // So, instead, we only use an aggressive approach when onside_sol_ct == 1
+  // (fortunately, that is almost always the case).
+  if (onside_sol_ct == 1) {
+    // It's not actually necessary to keep the entire likelihood array in
+    // memory.  This is similar to the HWE and Fisher's exact test
+    // calculations: we can get away with tracking a few partial sums, and
+    // exploit unimodality, fixed direction on both sides of the center,
+    // knowledge of the center's location, and the fact that we only need to
+    // classify the CI rather than fully evaluate it.
+    //
+    // Specifically, we need to determine the following:
+    // 1. Is highCI >= 0.98?  Or < 0.90?
+    // 2. If highCI >= 0.98, is lowCI >= 0.81?  In [0.71, 0.81)?  Equal to
+    //    0.70?  In [0.51, 0.70)?  In [0.01, 0.51)?  Or < 0.01?
+    //    (Crucially, if highCI < 0.98, we don't actually need to determine
+    //    lowCI at all.)
+    // To make this classification with as few relative likelihood evaluations
+    // as possible (5 logs, an exp call, 8 multiplies, 9 adds... that's kinda
+    // heavy for an inner loop operation), we distinguish the following cases:
+    // a. D' >= 0.41.  We first try to quickly rule out highCI >= 0.98 by
+    //    inspection of f(0.97).  Then,
+    //    * If it's below the futility threshold, jump to case (b).
+    //    * Otherwise, sum f(0.98)..f(1.00), and then sum other likelihoods
+    //      from f(0.96) on down.
+    // b. D' < 0.41.  highCI >= 0.98 is impossible since f(0.41) >= f(0.42) >=
+    //    ...; goal is to quickly establish highCI < 0.90.  A large fraction of
+    //    the time, this can be accomplished simply by inspecting f(0.89); if
+    //    it's less than 1/220, we're done because we know there's a 1
+    //    somewhere in the array, and the sum of the likelihoods between
+    //    f(0.89) and whatever that 1 entry is is bounded above by 12 * (1/220)
+    //    due to fixed direction.  Otherwise, we sum from the top down.
+    // This should be good for a ~10x speedup on the larger datasets where it's
+    // most wanted.
+    if (100 - center < 20 * (100 - strong_highci)) {
+      dxx = BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, strong_highci) - lnlike1;
+      // ln(2^{-53} / 19) is just under -39.6812
+      if ((center > strong_highci) || (dxx > -39.6812)) {
+	total_prob = exp(dxx);
+	for (quantile = 100; quantile > strong_highci; quantile--) {
+	  total_prob += exp(BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, quantile) - lnlike1);
+	}
+	if (total_prob > (1.0 / 19.0)) {
+	  // branch 1: highCI might be >= 0.98
+	  lnsurf_highstrong_thresh = total_prob * 20;
+	  for (quantile = strong_highci - 1; quantile >= recomb_highci; quantile--) {
+	    total_prob += exp(BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, quantile) - lnlike1);
+	  }
+	  lnsurf_highindiff_thresh = total_prob * 20;
+	  while (1) {
+	    dxx = exp(BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, quantile) - lnlike1);
+	    total_prob += dxx;
+	    // see comments on branch 2.  this is more complicated because we
+	    // still have work to do after resolving whether highCI >= 0.98,
+	    // but the reasoning is similar.
+	    if (total_prob >= lnsurf_highstrong_thresh) {
+	      if (quantile >= center) {
+	        goto haploview_blocks_classify_no_highstrong_1;
+	      }
+	      goto haploview_blocks_classify_no_highstrong_2;
+	    }
+	    if ((quantile <= lowci_max) && (quantile >= lowci_min)) {
+	      // We actually only need the [52..100], [71..100], [72..100], and
+	      // [82..100] right sums, but saving a few extra values is
+	      // probably more efficient than making this if-statement more
+	      // complicated.  [99 - quantile] rather than e.g. [quantile]
+	      // is used so memory writes go to sequentially increasing rather
+	      // than decreasing addresses.  (okay, this shouldn't matter since
+	      // everything should be in L1 cache, but there's negligible
+	      // opportunity cost)
+	      right_sum[quantile] = total_prob;
+	    }
+	    dxx *= ((int32_t)quantile);
+	    if (total_prob + dxx < lnsurf_highstrong_thresh) {
+	      while (1) {
+		// Now we want to bound lowCI, optimizing for being able to
+		// quickly establish lowCI >= 0.71.
+		if (dxx * 19 < total_prob) {
+		  // less than 5% remaining on left tail
+		  if (quantile >= lowci_max) {
+		    return 6;
+		  }
+		  while (quantile > lowci_min) {
+		    quantile--;
+		    total_prob += exp(BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, quantile) - lnlike1);
+		    if (quantile <= lowci_max) {
+		      right_sum[quantile] = total_prob;
+		    }
+		  }
+		  dyy = right_sum[lowci_min] * (20.0 / 19.0);
+		  while (total_prob < dyy) {
+		    if ((!quantile) || (dxx <= kRecip2m53B)) {
+		      total_prob *= 0.95;
+		      if (total_prob >= right_sum[strong_lowci_outer]) {
+			// lowCI < 0.70
+			// -> f(0.00) + f(0.01) + ... + f(0.70) > 0.05 * total
+			return 3;
+		      } else if (total_prob < right_sum[lowci_max]) {
+			return 6;
+		      } else if ((lowci_max > strong_lowci) && (total_prob < right_sum[strong_lowci])) {
+			return 5;
+		      }
+		      return 4;
+		    }
+		    quantile--;
+		    dxx = exp(BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, quantile) - lnlike1);
+		    total_prob += dxx;
+		  }
+		  return 2;
+		}
+		quantile--;
+		dxx = exp(BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, quantile) - lnlike1);
+		total_prob += dxx;
+		if ((quantile <= lowci_max) && (quantile >= lowci_min)) {
+		  right_sum[quantile] = total_prob;
+		}
+		dxx *= ((int32_t)quantile);
+	      }
+	    }
+	    quantile--;
+	  }
+	}
+      }
+      quantile = strong_highci - 1;
+    } else {
+      quantile = 100;
+    }
+    // branch 2: highCI guaranteed less than 0.98.  If D' <= 0.875, try to
+    // quickly establish highCI < 0.90.
+    dxx = BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, recomb_highci) - lnlike1;
+    if ((center < recomb_highci) && (dxx < recomb_fast_ln_thresh)) {
+      return 0;
+    }
+    // okay, we'll sum the whole right tail.  May as well sum from the outside
+    // in here for a bit more numerical stability, instead of adding exp(dxx)
+    // first.
+    do {
+      total_prob += exp(BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, quantile) - lnlike1);
+    } while (--quantile > recomb_highci);
+    total_prob += exp(dxx);
+    lnsurf_highindiff_thresh = total_prob * 20;
+  haploview_blocks_classify_no_highstrong_1:
+    quantile--;
+    if (center < recomb_highci) {
+      // if we know there's a 1.0 ahead in the likelihood array, may as well
+      // take advantage of that
+      lnsurf_highstrong_thresh = lnsurf_highindiff_thresh - 1.0;
+      while (quantile > center) {
+	total_prob += exp(BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, quantile) - lnlike1);
+	if (total_prob >= lnsurf_highstrong_thresh) {
+	  return 0;
+	}
+	quantile--;
+      }
+      if (!center) {
+	return 1;
+      }
+      total_prob += 1;
+      quantile--;
+    }
+    // likelihoods are now declining, try to exploit that to exit early
+    // (it's okay if the first likelihood does not represent a decline)
+    while (1) {
+      dxx = exp(BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, quantile) - lnlike1);
+      total_prob += dxx;
+    haploview_blocks_classify_no_highstrong_2:
+      if (total_prob >= lnsurf_highindiff_thresh) {
+	return 0;
+      }
+      if (total_prob + ((int32_t)quantile) * dxx < lnsurf_highindiff_thresh) {
+	// guaranteed to catch quantile == 0
+	return 1;
+      }
+      quantile--;
+    }
+  }
+  for (quantile = 100; quantile >= recomb_highci; quantile--) {
+    total_prob += exp(BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, quantile) - lnlike1);
+    if (quantile == strong_highci) {
+      lnsurf_highstrong_thresh = total_prob * 20;
+    }
+  }
+  if (total_prob < (1.0 / 19.0)) {
+    return 0;
+  }
+  lnsurf_highindiff_thresh = total_prob * 20;
+  while (1) {
+    total_prob += exp(BlocksCalcLnlikeQuantile(known11, known12, known21, known22, unknown_dh, freqx1, freq1x, freq2x, freq11_expected, denom, quantile) - lnlike1);
+    if (total_prob >= lnsurf_highindiff_thresh) {
+      return 0;
+    }
+    if (quantile <= lowci_max) {
+      if (quantile >= lowci_min) {
+        right_sum[quantile] = total_prob;
+      } else if (!quantile) {
+	break;
+      }
+    }
+    quantile--;
+  }
+  if (total_prob >= lnsurf_highstrong_thresh) {
+    return 1;
+  }
+  total_prob *= 0.95;
+  if (total_prob < right_sum[strong_lowci]) {
+    if ((lowci_max > strong_lowci) && (total_prob >= right_sum[lowci_max])) {
+      return 5;
+    }
+    return 6;
+  }
+  if (total_prob >= right_sum[strong_lowci_outer]) {
+    if ((lowci_min < strong_lowci_outer) && (total_prob >= right_sum[lowci_min])) {
+      return 2;
+    }
+    return 3;
+  }
+  return 4;
+}
+
+
+
+void InitBlocks(BlocksInfo* bip) {
+  bip->flags = kfBlocks0;
+  bip->max_bp = 200000;
+  bip->strong_lowci_outer = 71;
+  bip->strong_lowci = 72;
+  bip->strong_highci = 97;
+  bip->recomb_highci = 89;
+  bip->min_maf = 0.05;
+  bip->inform_frac = 0.95;
+}
+
+// --blocks: Haploview's reading of the Gabriel et al. (2002) haplotype block
+// definition.  A candidate block's endpoints must be in strong LD, and enough
+// of its internal pairs must be informative; candidates are then taken
+// greedily, longest first, without overlap.
+typedef struct BlockCandidateStruct {
+  uint32_t span;
+  uint32_t first_uidx;
+  uint32_t last_uidx;
+#ifdef __cplusplus
+  bool operator<(const struct BlockCandidateStruct& rhs) const {
+    // Longest first, then by start position, which is the order the greedy
+    // pass needs.
+    if (span != rhs.span) {
+      return (span > rhs.span);
+    }
+    return (first_uidx < rhs.first_uidx);
+  }
+#endif
+} BlockCandidate;
+
+// 3x3 genotype counts for a pair, in the (hom-A1, het, hom-A2) order
+// haploview_blocks_classify() expects.  A1 is ALT, so plink2's nyp codes map
+// to rows 2, 1, 0.
+static void BlocksPairCounts(const uintptr_t* geno_masks0, const uintptr_t* geno_masks1, uint32_t sample_ctl, uint32_t* counts) {
+  static const uint32_t nyp_order[3] = {2, 1, 0};
+  for (uint32_t ii = 0; ii != 3; ++ii) {
+    const uintptr_t* cur0 = &(geno_masks0[nyp_order[ii] * S_CAST(uintptr_t, sample_ctl)]);
+    for (uint32_t jj = 0; jj != 3; ++jj) {
+      const uintptr_t* cur1 = &(geno_masks1[nyp_order[jj] * S_CAST(uintptr_t, sample_ctl)]);
+      counts[ii * 3 + jj] = PopcountWordsIntersect(cur0, cur1, sample_ctl);
+    }
+  }
+}
+
+// Splits a genovec into one bitvector per genotype code, which is what the
+// pairwise counts above intersect.
+static void BlocksFillGenoMasks(const uintptr_t* genovec, uint32_t sample_ct, uint32_t sample_ctl, uintptr_t* geno_masks) {
+  for (uint32_t geno = 0; geno != 3; ++geno) {
+    uintptr_t* cur_mask = &(geno_masks[geno * S_CAST(uintptr_t, sample_ctl)]);
+    ZeroWArr(sample_ctl, cur_mask);
+    for (uint32_t sample_idx = 0; sample_idx != sample_ct; ++sample_idx) {
+      if (GetNyparrEntry(genovec, sample_idx) == geno) {
+        SetBit(sample_idx, cur_mask);
+      }
+    }
+  }
+}
+
+PglErr HaploviewBlocks(const uintptr_t* orig_variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const double* allele_freqs, const uintptr_t* founder_info, const PhenoCol* pheno_cols, const BlocksInfo* bip, uint32_t raw_sample_ct, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t pheno_ct, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  FILE* outfile = nullptr;
+  FILE* outfile_det = nullptr;
+  PglErr reterr = kPglRetSuccess;
+  {
+    const uint32_t no_pheno_req = (bip->flags / kfBlocksNoPhenoReq) & 1;
+    const uint32_t no_small_max_span = (bip->flags / kfBlocksNoSmallMaxSpan) & 1;
+    const uint32_t max_window_bp = bip->max_bp;
+    const uint32_t max_window_bp1 = no_small_max_span? 0x7fffffff : 20000;
+    const uint32_t max_window_bp2 = no_small_max_span? 0x7fffffff : 30000;
+    const uint32_t recomb_highci = bip->recomb_highci;
+    const uint32_t strong_highci = bip->strong_highci;
+    const uint32_t strong_lowci = bip->strong_lowci;
+    const uint32_t strong_lowci_outer = bip->strong_lowci_outer;
+    const double recomb_fast_ln_thresh = -log(u31tod((100 - recomb_highci) * 20));
+    const double inform_frac = bip->inform_frac + kSmallishEpsilonB;
+    const uint32_t inform_thresh_two = 1 + S_CAST(uint32_t, 3 * inform_frac);
+    const uint32_t inform_thresh_three = S_CAST(uint32_t, 6 * inform_frac);
+
+    const uint32_t raw_sample_ctl = BitCtToWordCt(raw_sample_ct);
+    uintptr_t* founder_pnm;
+    if (unlikely(bigstack_alloc_w(raw_sample_ctl, &founder_pnm))) {
+      goto HaploviewBlocks_ret_NOMEM;
+    }
+    memcpy(founder_pnm, founder_info, raw_sample_ctl * sizeof(intptr_t));
+    if (!no_pheno_req) {
+      // PLINK 1.x restricts to samples with a nonmissing phenotype unless told
+      // otherwise; any phenotype counts, as there it is a single column.
+      if (unlikely(!pheno_ct)) {
+        logerrputs("Warning: Skipping --blocks, since no phenotype is loaded.  ('no-pheno-req'\nremoves the phenotype restriction.)\n");
+        goto HaploviewBlocks_ret_1;
+      }
+      BitvecAnd(pheno_cols[0].nonmiss, raw_sample_ctl, founder_pnm);
+    }
+    const uint32_t founder_ct = PopcountWords(founder_pnm, raw_sample_ctl);
+    if (founder_ct < 2) {
+      logerrputs("Warning: Skipping --blocks, since there are less than two founders with\nnonmissing phenotypes.\n");
+      goto HaploviewBlocks_ret_1;
+    }
+
+    const uint32_t raw_variant_ctl = BitCtToWordCt(raw_variant_ct);
+    uintptr_t* variant_include;
+    uintptr_t* in_haploblock;
+    if (unlikely(bigstack_alloc_w(raw_variant_ctl, &variant_include) ||
+                 bigstack_calloc_w(raw_variant_ctl, &in_haploblock))) {
+      goto HaploviewBlocks_ret_NOMEM;
+    }
+    memcpy(variant_include, orig_variant_include, raw_variant_ctl * sizeof(intptr_t));
+    // Haploview ignores low-MAF variants outright, which is what PLINK 1.9
+    // replicates.
+    const double min_maf = bip->min_maf * (1 - kSmallEpsilon);
+    const double max_maf = 1 - min_maf;
+    {
+      uintptr_t variant_uidx_base = 0;
+      uintptr_t cur_bits = orig_variant_include[0];
+      for (uint32_t vidx = 0; vidx != variant_ct; ++vidx) {
+        const uint32_t variant_uidx = BitIter1(orig_variant_include, &variant_uidx_base, &cur_bits);
+        uint32_t drop = 0;
+        if (allele_idx_offsets && (allele_idx_offsets[variant_uidx + 1] - allele_idx_offsets[variant_uidx] != 2)) {
+          drop = 1;
+        } else if (bip->min_maf > 0.0) {
+          const uintptr_t allele_idx_offset_base = allele_idx_offsets? allele_idx_offsets[variant_uidx] : (variant_uidx * 2);
+          const double ref_freq = allele_freqs[allele_idx_offset_base - variant_uidx];
+          if ((ref_freq < min_maf) || (ref_freq > max_maf)) {
+            drop = 1;
+          }
+        }
+        if (drop) {
+          ClearBit(variant_uidx, variant_include);
+        }
+      }
+    }
+    // chrX needs the male-hemizygous handling classify() takes as counts[9..],
+    // which is out of scope here, so only diploid chromosomes are considered.
+    for (uint32_t chr_fo_idx = 0; chr_fo_idx != cip->chr_ct; ++chr_fo_idx) {
+      const uint32_t chr_idx = cip->chr_file_order[chr_fo_idx];
+      if (!IsSet(cip->haploid_mask, chr_idx)) {
+        continue;
+      }
+      const uint32_t chr_vidx_start = cip->chr_fo_vidx_start[chr_fo_idx];
+      const uint32_t chr_vidx_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+      ClearBitsNz(chr_vidx_start, chr_vidx_end, variant_include);
+    }
+    const uint32_t kept_variant_ct = PopcountWords(variant_include, raw_variant_ctl);
+    if (kept_variant_ct < 2) {
+      logerrprintf("Warning: Skipping --blocks since there are too few variants with MAF >= %g.\n", bip->min_maf);
+      goto HaploviewBlocks_ret_1;
+    }
+
+    uint32_t* founder_cumulative_popcounts;
+    uintptr_t* genovec;
+    if (unlikely(bigstack_alloc_u32(raw_sample_ctl, &founder_cumulative_popcounts) ||
+                 bigstack_alloc_w(NypCtToWordCt(founder_ct), &genovec))) {
+      goto HaploviewBlocks_ret_NOMEM;
+    }
+    FillCumulativePopcounts(founder_pnm, raw_sample_ctl, founder_cumulative_popcounts);
+    PgrSampleSubsetIndex pssi;
+    PgrSetSampleSubsetIndex(founder_cumulative_popcounts, simple_pgrp, &pssi);
+    const uint32_t founder_ctl = BitCtToWordCt(founder_ct);
+
+    // Ring buffer over the widest window, as in --ld-score.
+    uint32_t max_block_size = 2;
+    uint32_t* chr_variant_uidxs;
+    if (unlikely(bigstack_alloc_u32(kept_variant_ct, &chr_variant_uidxs))) {
+      goto HaploviewBlocks_ret_NOMEM;
+    }
+    for (uint32_t chr_fo_idx = 0; chr_fo_idx != cip->chr_ct; ++chr_fo_idx) {
+      const uint32_t chr_vidx_start = cip->chr_fo_vidx_start[chr_fo_idx];
+      const uint32_t chr_vidx_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+      const uint32_t chr_variant_ct = PopcountBitRange(variant_include, chr_vidx_start, chr_vidx_end);
+      if (chr_variant_ct < 2) {
+        continue;
+      }
+      uintptr_t variant_uidx_base;
+      uintptr_t cur_bits;
+      BitIter1Start(variant_include, chr_vidx_start, &variant_uidx_base, &cur_bits);
+      for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+        chr_variant_uidxs[cidx] = BitIter1(variant_include, &variant_uidx_base, &cur_bits);
+      }
+      uint32_t start_cidx = 0;
+      for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+        const uint32_t cur_bp = variant_bps[chr_variant_uidxs[cidx]];
+        while (cur_bp - variant_bps[chr_variant_uidxs[start_cidx]] > max_window_bp) {
+          ++start_cidx;
+        }
+        const uint32_t cur_window_ct = cidx - start_cidx + 1;
+        if (cur_window_ct > max_block_size) {
+          max_block_size = cur_window_ct;
+        }
+      }
+    }
+
+    const uintptr_t geno_mask_stride = 3 * S_CAST(uintptr_t, founder_ctl);
+    uintptr_t* window_masks;
+    uint32_t* window_uidxs;
+    uint32_t* strong_cts;
+    uint32_t* rec_cts;
+    if (unlikely(bigstack_alloc_w(max_block_size * geno_mask_stride, &window_masks) ||
+                 bigstack_alloc_u32(max_block_size, &window_uidxs) ||
+                 bigstack_alloc_u32(max_block_size, &strong_cts) ||
+                 bigstack_alloc_u32(max_block_size, &rec_cts))) {
+      goto HaploviewBlocks_ret_NOMEM;
+    }
+    // Candidates take whatever is left; PLINK 1.9 does the same.
+    const uintptr_t max_candidates = bigstack_left() / (2 * sizeof(BlockCandidate));
+    BlockCandidate* candidates;
+    if (unlikely(BIGSTACK_ALLOC_X(BlockCandidate, max_candidates, &candidates))) {
+      goto HaploviewBlocks_ret_NOMEM;
+    }
+    uintptr_t candidate_ct = 0;
+
+    fputs("--blocks: 0%", stdout);
+    fflush(stdout);
+    uint32_t pct = 0;
+    uint32_t variants_done = 0;
+    for (uint32_t chr_fo_idx = 0; chr_fo_idx != cip->chr_ct; ++chr_fo_idx) {
+      const uint32_t chr_vidx_start = cip->chr_fo_vidx_start[chr_fo_idx];
+      const uint32_t chr_vidx_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+      const uint32_t chr_variant_ct = PopcountBitRange(variant_include, chr_vidx_start, chr_vidx_end);
+      if (chr_variant_ct < 2) {
+        variants_done += chr_variant_ct;
+        continue;
+      }
+      {
+        uintptr_t variant_uidx_base;
+        uintptr_t cur_bits;
+        BitIter1Start(variant_include, chr_vidx_start, &variant_uidx_base, &cur_bits);
+        for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+          chr_variant_uidxs[cidx] = BitIter1(variant_include, &variant_uidx_base, &cur_bits);
+        }
+      }
+      uint32_t window_start_cidx = 0;
+      // Rolling history of the five pairwise classifications among the last
+      // four markers, which the small-block rules consult.  [0] and [1] are
+      // the current marker's delta-1 and delta-2 pairs, [2] and [3] the
+      // previous marker's, [4] the one before that.
+      uint32_t recent_ci_types[5];
+      recent_ci_types[0] = 0;
+      recent_ci_types[1] = 0;
+      recent_ci_types[2] = 0;
+      recent_ci_types[3] = 0;
+      recent_ci_types[4] = 0;
+      for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+        const uint32_t cur_uidx = chr_variant_uidxs[cidx];
+        const uint32_t cur_bp = variant_bps[cur_uidx];
+        while (cur_bp - variant_bps[chr_variant_uidxs[window_start_cidx]] > max_window_bp) {
+          ++window_start_cidx;
+        }
+        const uint32_t cur_slot = cidx % max_block_size;
+        reterr = PgrGet(founder_pnm, pssi, founder_ct, cur_uidx, simple_pgrp, genovec);
+        if (unlikely(reterr)) {
+          PgenErrPrintNV(reterr, cur_uidx);
+          goto HaploviewBlocks_ret_1;
+        }
+        ZeroTrailingNyps(founder_ct, genovec);
+        BlocksFillGenoMasks(genovec, founder_ct, founder_ctl, &(window_masks[cur_slot * geno_mask_stride]));
+        window_uidxs[cur_slot] = cur_uidx;
+        strong_cts[cur_slot] = 0;
+        rec_cts[cur_slot] = 0;
+        if (cidx == window_start_cidx) {
+          continue;
+        }
+        recent_ci_types[4] = recent_ci_types[2];
+        recent_ci_types[2] = recent_ci_types[0];
+        recent_ci_types[3] = recent_ci_types[1];
+        uint32_t lowci_max = 82;
+        uint32_t lowci_min = 52;
+        uint32_t cur_strong = 0;
+        uint32_t cur_rec = 0;
+        const uint32_t max_delta = cidx - window_start_cidx;
+        for (uint32_t delta = 1; delta <= max_delta; ++delta) {
+          const uint32_t other_cidx = cidx - delta;
+          const uint32_t other_slot = other_cidx % max_block_size;
+          uint32_t counts[9];
+          BlocksPairCounts(&(window_masks[cur_slot * geno_mask_stride]), &(window_masks[other_slot * geno_mask_stride]), founder_ctl, counts);
+          const uint32_t cur_ci_type = HaploviewBlocksClassify(counts, lowci_max, lowci_min, recomb_highci, strong_highci, strong_lowci, strong_lowci_outer, 0, recomb_fast_ln_thresh);
+          if (cur_ci_type > 4) {
+            ++cur_strong;
+          } else if (!cur_ci_type) {
+            ++cur_rec;
+          }
+          uint32_t save_candidate = 0;
+          if (delta < 4) {
+            if (delta == 1) {
+              lowci_max = strong_lowci;
+              recent_ci_types[0] = cur_ci_type;
+              if ((cur_ci_type == 6) && (cur_bp - variant_bps[window_uidxs[other_slot]] <= max_window_bp1)) {
+                save_candidate = 1;
+              }
+            } else if (delta == 2) {
+              recent_ci_types[1] = cur_ci_type;
+              if ((cur_ci_type >= 4) && (cur_bp - variant_bps[window_uidxs[other_slot]] <= max_window_bp2)) {
+                uint32_t uii = 1;
+                if (recent_ci_types[0] >= 3) {
+                  ++uii;
+                }
+                if (recent_ci_types[2] >= 3) {
+                  ++uii;
+                }
+                if (uii >= inform_thresh_two) {
+                  save_candidate = 1;
+                }
+              }
+            } else {
+              lowci_min = strong_lowci_outer;
+              uint32_t prev_strong = 0;
+              uint32_t prev_rec = 0;
+              uint32_t uii = 0;
+              if (cur_ci_type > 4) {
+                ++prev_strong;
+              } else if (!cur_ci_type) {
+                ++prev_rec;
+              }
+              for (uint32_t ujj = 0; ujj != 5; ++ujj) {
+                if (recent_ci_types[ujj] >= 3) {
+                  ++uii;
+                  if (recent_ci_types[ujj] > 4) {
+                    ++prev_strong;
+                  }
+                } else if (!recent_ci_types[ujj]) {
+                  ++prev_rec;
+                }
+              }
+              strong_cts[other_slot] = prev_strong;
+              rec_cts[other_slot] = prev_rec;
+              if ((cur_ci_type >= 4) && (uii >= inform_thresh_three)) {
+                save_candidate = 1;
+              }
+            }
+          } else {
+            const uint32_t prev_strong = strong_cts[other_slot] + cur_strong;
+            const uint32_t prev_rec = rec_cts[other_slot] + cur_rec;
+            strong_cts[other_slot] = prev_strong;
+            rec_cts[other_slot] = prev_rec;
+            const uint32_t informative_ct = prev_strong + prev_rec;
+            if ((cur_ci_type >= 4) && (informative_ct >= 6) && (S_CAST(double, informative_ct) * inform_frac < u31tod(prev_strong))) {
+              save_candidate = 1;
+            }
+          }
+          if (save_candidate) {
+            if (unlikely(candidate_ct == max_candidates)) {
+              goto HaploviewBlocks_ret_NOMEM;
+            }
+            const uint32_t other_uidx = window_uidxs[other_slot];
+            candidates[candidate_ct].span = cur_bp - variant_bps[other_uidx];
+            candidates[candidate_ct].first_uidx = other_uidx;
+            candidates[candidate_ct].last_uidx = cur_uidx;
+            ++candidate_ct;
+          }
+        }
+        ++variants_done;
+        if (variants_done * 100LLU >= (pct + 1) * S_CAST(uint64_t, kept_variant_ct)) {
+          if (pct > 10) {
+            putc_unlocked('\b', stdout);
+          }
+          pct = (variants_done * 100LLU) / kept_variant_ct;
+          printf("\b\b%u%%", pct++);
+          fflush(stdout);
+        }
+      }
+    }
+    fputs("\b\b\b", stdout);
+
+    // Longest first, skipping anything that touches an accepted block.
+    STD_SORT(candidate_ct, BlockCandidateCmp, candidates);
+    snprintf(outname_end, kMaxOutfnameExtBlen, ".blocks");
+    if (unlikely(fopen_checked(outname, FOPEN_WB, &outfile))) {
+      goto HaploviewBlocks_ret_OPEN_FAIL;
+    }
+    snprintf(outname_end, kMaxOutfnameExtBlen, ".blocks.det");
+    if (unlikely(fopen_checked(outname, FOPEN_WB, &outfile_det))) {
+      goto HaploviewBlocks_ret_OPEN_FAIL;
+    }
+    fputs("#CHROM\tBP1\tBP2\tKB\tNSNPS\tSNPS" EOLN_STR, outfile_det);
+    uint32_t block_ct = 0;
+    {
+      const uint32_t max_chr_blen = GetMaxChrSlen(cip) + 1;
+      char* chr_buf;
+      char* writebuf;
+      if (unlikely(bigstack_alloc_c(max_chr_blen, &chr_buf) ||
+                   bigstack_alloc_c(kMaxMediumLine + max_chr_blen + 256, &writebuf))) {
+        goto HaploviewBlocks_ret_NOMEM;
+      }
+      // Accepted blocks are emitted in genomic order, so they are collected
+      // first and sorted by position.
+      BlockCandidate* accepted;
+      if (unlikely(BIGSTACK_ALLOC_X(BlockCandidate, candidate_ct + 1, &accepted))) {
+        goto HaploviewBlocks_ret_NOMEM;
+      }
+      for (uintptr_t cand_idx = 0; cand_idx != candidate_ct; ++cand_idx) {
+        const uint32_t first_uidx = candidates[cand_idx].first_uidx;
+        const uint32_t last_uidx = candidates[cand_idx].last_uidx;
+        if (!AllBitsAreZero(in_haploblock, first_uidx, last_uidx + 1)) {
+          continue;
+        }
+        FillBitsNz(first_uidx, last_uidx + 1, in_haploblock);
+        accepted[block_ct] = candidates[cand_idx];
+        ++block_ct;
+      }
+      for (uint32_t ii = 1; ii < block_ct; ++ii) {
+        const BlockCandidate cur = accepted[ii];
+        uint32_t jj = ii;
+        while (jj && (accepted[jj - 1].first_uidx > cur.first_uidx)) {
+          accepted[jj] = accepted[jj - 1];
+          --jj;
+        }
+        accepted[jj] = cur;
+      }
+      for (uint32_t block_idx = 0; block_idx != block_ct; ++block_idx) {
+        const uint32_t first_uidx = accepted[block_idx].first_uidx;
+        const uint32_t last_uidx = accepted[block_idx].last_uidx;
+        char* write_iter = writebuf;
+        char* chr_name_end = chrtoa(cip, GetVariantChr(cip, first_uidx), chr_buf);
+        const uint32_t chr_slen = chr_name_end - chr_buf;
+        write_iter = memcpyax(write_iter, chr_buf, chr_slen, '\t');
+        write_iter = u32toa_x(variant_bps[first_uidx], '\t', write_iter);
+        write_iter = u32toa_x(variant_bps[last_uidx], '\t', write_iter);
+        write_iter = dtoa_g(u31tod(variant_bps[last_uidx] - variant_bps[first_uidx] + 1) * 0.001, write_iter);
+        *write_iter++ = '\t';
+        uint32_t nsnps = 0;
+        for (uint32_t uidx = first_uidx; uidx <= last_uidx; ++uidx) {
+          if (IsSet(variant_include, uidx)) {
+            ++nsnps;
+          }
+        }
+        write_iter = u32toa_x(nsnps, '\t', write_iter);
+        if (unlikely(fwrite_checked(writebuf, write_iter - writebuf, outfile_det))) {
+          goto HaploviewBlocks_ret_WRITE_FAIL;
+        }
+        // .blocks lists the same variants, one line per block, '*'-prefixed.
+        fputs("*", outfile);
+        uint32_t written = 0;
+        for (uint32_t uidx = first_uidx; uidx <= last_uidx; ++uidx) {
+          if (!IsSet(variant_include, uidx)) {
+            continue;
+          }
+          putc_unlocked(' ', outfile);
+          fputs(variant_ids[uidx], outfile);
+          if (written) {
+            putc_unlocked('|', outfile_det);
+          }
+          fputs(variant_ids[uidx], outfile_det);
+          ++written;
+        }
+        putc_unlocked('\n', outfile);
+        fputs(EOLN_STR, outfile_det);
+      }
+    }
+    if (unlikely(fclose_null(&outfile))) {
+      goto HaploviewBlocks_ret_WRITE_FAIL;
+    }
+    if (unlikely(fclose_null(&outfile_det))) {
+      goto HaploviewBlocks_ret_WRITE_FAIL;
+    }
+    *outname_end = '\0';
+    logprintfww("--blocks: %u haploblock%s written to %s.blocks , with details in %s.blocks.det .\n", block_ct, (block_ct == 1)? "" : "s", outname, outname);
+  }
+  while (0) {
+  HaploviewBlocks_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  HaploviewBlocks_ret_OPEN_FAIL:
+    reterr = kPglRetOpenFail;
+    break;
+  HaploviewBlocks_ret_WRITE_FAIL:
+    reterr = kPglRetWriteFail;
+    break;
+  }
+ HaploviewBlocks_ret_1:
+  fclose_cond(outfile);
+  fclose_cond(outfile_det);
+  BigstackReset(bigstack_mark);
+  return reterr;
+}
+
+// --test-mishap: PLINK 1.x's check for association between a variant's missing
+// calls and the flanking haplotypes.  A strong association usually means the
+// missingness is a genotyping artifact of the local haplotype background
+// rather than random dropout.
+// Sets bit i in dst iff genoarr's nyp i equals match_val.  Assumes trailing
+// genoarr bits are cleared.
+void GenoarrMatchToBitvec(const uintptr_t* __restrict genoarr, uint32_t sample_ct, uint32_t match_val, uintptr_t* __restrict dst) {
+  const uint32_t sample_ctl2 = NypCtToWordCt(sample_ct);
+  const uintptr_t xor_word = ((match_val & 1)? kMask5555 : 0) | ((match_val & 2)? (kMask5555 * 2) : 0);
+  Halfword* __attribute__((may_alias)) dst_alias = DowncastWToHW(dst);
+  for (uint32_t widx = 0; widx != sample_ctl2; ++widx) {
+    const uintptr_t ww = genoarr[widx] ^ xor_word;
+    dst_alias[widx] = PackWordToHalfword((~(ww | (ww >> 1))) & kMask5555);
+  }
+  if (sample_ctl2 % 2) {
+    dst_alias[sample_ctl2] = 0;
+  }
+  ZeroTrailingBits(sample_ct, dst);
+}
+
+// PLINK 1.x zero-fills the absent flank, which in its encoding makes every
+// sample homozygous for A1.  A1 is plink2's ALT, so nyp 2 is the equivalent.
+static void FillAllHomAlt(uint32_t sample_ct, uintptr_t* genoarr) {
+  const uint32_t sample_ctl2 = NypCtToWordCt(sample_ct);
+  for (uint32_t widx = 0; widx != sample_ctl2; ++widx) {
+    genoarr[widx] = kMask5555 * 2;
+  }
+  ZeroTrailingNyps(sample_ct, genoarr);
+}
+
+static char* TestMishapWriteLine(const char* variant_id, const char* prev_aptr, const char* next_aptr, const double* total_cts, const double* curhap_cts, double tot_recip, double output_min_ln, const char* flankstr, char* cswritep) {
+  // total_cts[0] is the haplotype count on the central-call-missing side,
+  // total_cts[1] the nonmissing side; curhap_cts is the same split for the one
+  // haplotype this row is about.
+  const double casen_1 = total_cts[0] - curhap_cts[0];
+  const double ctrln_1 = total_cts[1] - curhap_cts[1];
+  cswritep = strcpyax(cswritep, variant_id, '\t');
+  if (prev_aptr) {
+    cswritep = strcpya(cswritep, prev_aptr);
+  }
+  if (next_aptr) {
+    cswritep = strcpya(cswritep, next_aptr);
+  }
+  *cswritep++ = '\t';
+  if (total_cts[0] > 0.0) {
+    cswritep = dtoa_g(curhap_cts[0] / total_cts[0], cswritep);
+  } else {
+    cswritep = strcpya_k(cswritep, "NA");
+  }
+  *cswritep++ = '\t';
+  if (total_cts[1] > 0.0) {
+    cswritep = dtoa_g(curhap_cts[1] / total_cts[1], cswritep);
+  } else {
+    cswritep = strcpya_k(cswritep, "NA");
+  }
+  *cswritep++ = '\t';
+  cswritep = dtoa_g(curhap_cts[0], cswritep);
+  *cswritep++ = '/';
+  cswritep = dtoa_g(curhap_cts[1], cswritep);
+  *cswritep++ = '\t';
+  cswritep = dtoa_g(casen_1, cswritep);
+  *cswritep++ = '/';
+  cswritep = dtoa_g(ctrln_1, cswritep);
+  *cswritep++ = '\t';
+  if ((curhap_cts[0] > 0.0) && (curhap_cts[1] > 0.0) && (casen_1 > 0.0) && (ctrln_1 > 0.0)) {
+    double row_mult = (curhap_cts[0] + curhap_cts[1]) * tot_recip;
+    double cur_expected = row_mult * total_cts[0];
+    double dxx = curhap_cts[0] - cur_expected;
+    double chisq = dxx * dxx / cur_expected;
+    cur_expected = row_mult * total_cts[1];
+    dxx = curhap_cts[1] - cur_expected;
+    chisq += dxx * dxx / cur_expected;
+    row_mult = (total_cts[0] + total_cts[1]) * tot_recip - row_mult;
+    cur_expected = row_mult * total_cts[0];
+    dxx = casen_1 - cur_expected;
+    chisq += dxx * dxx / cur_expected;
+    cur_expected = row_mult * total_cts[1];
+    dxx = ctrln_1 - cur_expected;
+    chisq += dxx * dxx / cur_expected;
+    cswritep = dtoa_g(chisq, cswritep);
+    *cswritep++ = '\t';
+    const double ln_pval = ChisqToLnP(chisq, 1);
+    cswritep = lntoa_g(MAXV(ln_pval, output_min_ln), cswritep);
+  } else {
+    cswritep = strcpya_k(cswritep, "NA\tNA");
+  }
+  *cswritep++ = '\t';
+  cswritep = strcpya(cswritep, flankstr);
+  AppendBinaryEoln(&cswritep);
+  return cswritep;
+}
+
+// PgrGetInv1() counts maj_alleles[]; the report has to name that allele, and
+// for a multiallelic variant the collapsed side has no single name.
+void TestMishapAlleleNames(const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const AlleleCode* maj_alleles, uint32_t variant_uidx, const char** a1_ptr, const char** a2_ptr) {
+  const uintptr_t allele_idx_offset_base = allele_idx_offsets? allele_idx_offsets[variant_uidx] : (2 * S_CAST(uintptr_t, variant_uidx));
+  const uint32_t allele_ct = allele_idx_offsets? (allele_idx_offsets[variant_uidx + 1] - allele_idx_offset_base) : 2;
+  const AlleleCode maj_aidx = maj_alleles[variant_uidx];
+  *a1_ptr = allele_storage[allele_idx_offset_base + maj_aidx];
+  *a2_ptr = (allele_ct == 2)? allele_storage[allele_idx_offset_base + 1 - maj_aidx] : ".";
+}
+
+PglErr TestMishap(const uintptr_t* orig_variant_include, const ChrInfo* cip, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const AlleleCode* maj_alleles, const char* const* allele_storage, const uintptr_t* sample_include, TestMishapFlags flags, double min_maf, double output_min_ln, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  char* cswritep = nullptr;
+  CompressStreamState css;
+  PglErr reterr = kPglRetSuccess;
+  PreinitCstream(&css);
+  {
+    if (unlikely(IsSet(cip->haploid_mask, 1))) {
+      logerrputs("Error: --test-mishap can only be used on diploid genomes.\n");
+      goto TestMishap_ret_INCONSISTENT_INPUT;
+    }
+    if (sample_ct < 2) {
+      logerrputs("Warning: Skipping --test-mishap, since there are less than two samples.\n");
+      goto TestMishap_ret_1;
+    }
+    const uint32_t raw_variant_ctl = BitCtToWordCt(raw_variant_ct);
+    uintptr_t* variant_include;
+    if (unlikely(bigstack_alloc_w(raw_variant_ctl, &variant_include))) {
+      goto TestMishap_ret_NOMEM;
+    }
+    memcpy(variant_include, orig_variant_include, raw_variant_ctl * sizeof(intptr_t));
+    // The haplotype tables below are biallelic by construction, and PLINK 1.x
+    // had no multiallelic representation to begin with.
+    // The flanking-haplotype model has no hemizygous case, so PLINK 1.x skips
+    // haploid chromosomes outright.
+    for (uint32_t chr_fo_idx = 0; chr_fo_idx != cip->chr_ct; ++chr_fo_idx) {
+      const uint32_t chr_idx = cip->chr_file_order[chr_fo_idx];
+      if (!IsSet(cip->haploid_mask, chr_idx)) {
+        continue;
+      }
+      const uint32_t chr_vidx_start = cip->chr_fo_vidx_start[chr_fo_idx];
+      const uint32_t chr_vidx_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+      ClearBitsNz(chr_vidx_start, chr_vidx_end, variant_include);
+    }
+    const uint32_t kept_variant_ct = PopcountWords(variant_include, raw_variant_ctl);
+    if (kept_variant_ct < 2) {
+      logerrputs("Warning: Skipping --test-mishap, since there are too few eligible variants.\n");
+      goto TestMishap_ret_1;
+    }
+
+    const uint32_t raw_sample_ctl = BitCtToWordCt(raw_sample_ct);
+    const uint32_t sample_ctl = BitCtToWordCt(sample_ct);
+    const uint32_t sample_ctl2 = NypCtToWordCt(sample_ct);
+    uint32_t* sample_include_cumulative_popcounts;
+    uintptr_t* genobufs;
+    uintptr_t* cur_class_mask;
+    uintptr_t* cell_mask;
+    uint32_t* chr_variant_uidxs;
+    if (unlikely(bigstack_alloc_u32(raw_sample_ctl, &sample_include_cumulative_popcounts) ||
+                 bigstack_alloc_w(3 * S_CAST(uintptr_t, sample_ctl2), &genobufs) ||
+                 bigstack_alloc_w(sample_ctl, &cur_class_mask) ||
+                 bigstack_alloc_w(sample_ctl, &cell_mask) ||
+                 bigstack_alloc_u32(kept_variant_ct, &chr_variant_uidxs))) {
+      goto TestMishap_ret_NOMEM;
+    }
+    FillCumulativePopcounts(sample_include, raw_sample_ctl, sample_include_cumulative_popcounts);
+    PgrSampleSubsetIndex pssi;
+    PgrSetSampleSubsetIndex(sample_include_cumulative_popcounts, simple_pgrp, &pssi);
+
+    const uint32_t output_zst = (flags / kfTestMishapZs) & 1;
+    OutnameZstSet(".missing.hap", output_zst, outname_end);
+    reterr = InitCstreamAlloc(outname, 0, output_zst, max_thread_ct, kCompressStreamBlock + kMaxMediumLine, &css, &cswritep);
+    if (unlikely(reterr)) {
+      goto TestMishap_ret_1;
+    }
+    cswritep = strcpya_k(cswritep, "#ID\tHAPLOTYPE\tF_0\tF_1\tM_H1\tM_H2\tCHISQ\tP\tFLANKING" EOLN_STR);
+
+    min_maf *= 1 - kSmallEpsilon;
+    // Enough room for "<prev_id>|<next_id>".
+    char* flankstr;
+    if (unlikely(bigstack_alloc_c(2 * kMaxIdSlen + 4, &flankstr))) {
+      goto TestMishap_ret_NOMEM;
+    }
+    uint32_t counts[27];
+    double hap_ct_table[10];
+    uint32_t inspected_ct = 0;
+    for (uint32_t chr_fo_idx = 0; chr_fo_idx != cip->chr_ct; ++chr_fo_idx) {
+      const uint32_t chr_vidx_start = cip->chr_fo_vidx_start[chr_fo_idx];
+      const uint32_t chr_vidx_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+      const uint32_t chr_variant_ct = PopcountBitRange(variant_include, chr_vidx_start, chr_vidx_end);
+      if (chr_variant_ct < 2) {
+        continue;
+      }
+      {
+        uintptr_t variant_uidx_base;
+        uintptr_t cur_bits;
+        BitIter1Start(variant_include, chr_vidx_start, &variant_uidx_base, &cur_bits);
+        for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+          chr_variant_uidxs[cidx] = BitIter1(variant_include, &variant_uidx_base, &cur_bits);
+        }
+      }
+      uintptr_t* prev_genovec = genobufs;
+      uintptr_t* cur_genovec = &(genobufs[sample_ctl2]);
+      uintptr_t* next_genovec = &(genobufs[2 * S_CAST(uintptr_t, sample_ctl2)]);
+      FillAllHomAlt(sample_ct, prev_genovec);
+      reterr = PgrGetInv1(sample_include, pssi, sample_ct, chr_variant_uidxs[0], maj_alleles[chr_variant_uidxs[0]], simple_pgrp, cur_genovec);
+      if (unlikely(reterr)) {
+        goto TestMishap_ret_PGR_FAIL;
+      }
+      ZeroTrailingNyps(sample_ct, cur_genovec);
+      STD_ARRAY_DECL(uint32_t, 4, cur_genocounts);
+      GenoarrCountFreqsUnsafe(cur_genovec, sample_ct, cur_genocounts);
+      uint32_t missing_ct_cur = cur_genocounts[3];
+      uint32_t have_prev = 0;
+      for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+        const uint32_t have_next = (cidx + 1 != chr_variant_ct);
+        uint32_t missing_ct_next = 0;
+        if (have_next) {
+          const uint32_t next_uidx_load = chr_variant_uidxs[cidx + 1];
+          reterr = PgrGetInv1(sample_include, pssi, sample_ct, next_uidx_load, maj_alleles[next_uidx_load], simple_pgrp, next_genovec);
+          if (unlikely(reterr)) {
+            goto TestMishap_ret_PGR_FAIL;
+          }
+          ZeroTrailingNyps(sample_ct, next_genovec);
+          STD_ARRAY_DECL(uint32_t, 4, next_genocounts);
+          GenoarrCountFreqsUnsafe(next_genovec, sample_ct, next_genocounts);
+          missing_ct_next = next_genocounts[3];
+        } else {
+          FillAllHomAlt(sample_ct, next_genovec);
+        }
+        if (missing_ct_cur >= 5) {
+          // counts[9 * m + 3 * p + n]: m is 0 when the central call is
+          // missing, p and n index the flanking genotypes in PLINK 1.x's
+          // (hom A1, het, hom A2) order.  A1 is plink2's ALT, so PLINK 1.x's
+          // genotype index is 2 minus the nyp value.
+          for (uint32_t class_idx = 0; class_idx != 2; ++class_idx) {
+            if (!class_idx) {
+              GenoarrMatchToBitvec(cur_genovec, sample_ct, 3, cur_class_mask);
+            } else {
+              GenoarrToNonmissing(cur_genovec, sample_ct, cur_class_mask);
+            }
+            for (uint32_t prev_idx = 0; prev_idx != 3; ++prev_idx) {
+              GenoarrMatchToBitvec(prev_genovec, sample_ct, 2 - prev_idx, cell_mask);
+              BitvecAnd(cur_class_mask, sample_ctl, cell_mask);
+              const uint32_t cell_ct = PopcountWords(cell_mask, sample_ctl);
+              uint32_t* cur_counts = &(counts[9 * class_idx + 3 * prev_idx]);
+              if (!cell_ct) {
+                cur_counts[0] = 0;
+                cur_counts[1] = 0;
+                cur_counts[2] = 0;
+                continue;
+              }
+              STD_ARRAY_DECL(uint32_t, 4, cell_genocounts);
+              GenoarrCountSubsetFreqs2(next_genovec, cell_mask, sample_ct, cell_ct, cell_genocounts);
+              // Drop cell_genocounts[3]: PLINK 1.x also excludes samples whose
+              // next-flank call is missing.
+              cur_counts[0] = cell_genocounts[2];
+              cur_counts[1] = cell_genocounts[1];
+              cur_counts[2] = cell_genocounts[0];
+            }
+          }
+          const uint32_t cur_uidx = chr_variant_uidxs[cidx];
+          const char* variant_id = variant_ids[cur_uidx];
+          const char* prev_a1 = nullptr;
+          const char* prev_a2 = nullptr;
+          if (have_prev) {
+            const uint32_t prev_uidx = chr_variant_uidxs[cidx - 1];
+            TestMishapAlleleNames(allele_idx_offsets, allele_storage, maj_alleles, prev_uidx, &prev_a1, &prev_a2);
+          }
+          double orig_cmiss_tot = 0.0;
+          double orig_cnm_tot = 0.0;
+          double tot_recip;
+          if (have_next) {
+            const uint32_t next_uidx = chr_variant_uidxs[cidx + 1];
+            const char* next_a1;
+            const char* next_a2;
+            TestMishapAlleleNames(allele_idx_offsets, allele_storage, maj_alleles, next_uidx, &next_a1, &next_a2);
+            if (have_prev) {
+              hap_ct_table[0] = 2 * S_CAST(int32_t, counts[0] + counts[1] + counts[2] + counts[3] + counts[4] + counts[5] + counts[6] + counts[7] + counts[8]);
+              hap_ct_table[1] = 2 * S_CAST(int32_t, counts[9] + counts[10] + counts[11] + counts[12] + counts[13] + counts[14] + counts[15] + counts[16] + counts[17]);
+              tot_recip = hap_ct_table[0] + hap_ct_table[1];
+              if (tot_recip == 0.0) {
+                goto TestMishap_next_variant;
+              }
+              orig_cmiss_tot = hap_ct_table[0];
+              orig_cnm_tot = hap_ct_table[1];
+              char* flank_iter = strcpyax(flankstr, variant_ids[chr_variant_uidxs[cidx - 1]], '|');
+              flank_iter = strcpya(flank_iter, variant_ids[next_uidx]);
+              *flank_iter = '\0';
+              hap_ct_table[2] = S_CAST(int32_t, 2 * counts[0] + counts[1] + counts[3]);
+              hap_ct_table[3] = S_CAST(int32_t, 2 * counts[9] + counts[10] + counts[12]);
+              hap_ct_table[4] = S_CAST(int32_t, 2 * counts[2] + counts[1] + counts[5]);
+              hap_ct_table[5] = S_CAST(int32_t, 2 * counts[11] + counts[10] + counts[14]);
+              hap_ct_table[6] = S_CAST(int32_t, 2 * counts[6] + counts[3] + counts[7]);
+              hap_ct_table[7] = S_CAST(int32_t, 2 * counts[15] + counts[12] + counts[16]);
+              hap_ct_table[8] = S_CAST(int32_t, 2 * counts[8] + counts[5] + counts[7]);
+              hap_ct_table[9] = S_CAST(int32_t, 2 * counts[17] + counts[14] + counts[16]);
+              if (counts[4] + counts[13]) {
+                for (uint32_t uii = 0; uii != 9; ++uii) {
+                  counts[18 + uii] = counts[uii] + counts[9 + uii];
+                }
+                // Double-heterozygotes are split between the two phases in the
+                // proportion the EM estimate implies.
+                const double known11 = S_CAST(int32_t, 2 * counts[18] + counts[19] + counts[21]);
+                const double known12 = S_CAST(int32_t, 2 * counts[20] + counts[19] + counts[23]);
+                const double known21 = S_CAST(int32_t, 2 * counts[24] + counts[21] + counts[25]);
+                const double known22 = S_CAST(int32_t, 2 * counts[26] + counts[23] + counts[25]);
+                double freq1x;
+                double freq2x;
+                double freqx1;
+                double freqx2;
+                double freq11;
+                BlocksEmPhaseHethet(known11, known12, known21, known22, counts[22], &freq1x, &freq2x, &freqx1, &freqx2, &freq11, nullptr);
+                double dxx = (freq11 * tot_recip - (hap_ct_table[2] + hap_ct_table[3])) / S_CAST(int32_t, counts[4] + counts[13]);
+                double dyy = S_CAST(int32_t, counts[4]) * dxx;
+                double dzz = S_CAST(int32_t, counts[13]) * dxx;
+                hap_ct_table[2] += dyy;
+                hap_ct_table[3] += dzz;
+                hap_ct_table[8] += dyy;
+                hap_ct_table[9] += dzz;
+                dxx = 1.0 - dxx;
+                dyy = S_CAST(int32_t, counts[4]) * dxx;
+                dzz = S_CAST(int32_t, counts[13]) * dxx;
+                hap_ct_table[4] += dyy;
+                hap_ct_table[5] += dzz;
+                hap_ct_table[6] += dyy;
+                hap_ct_table[7] += dzz;
+              }
+              const double maf_thresh = min_maf * tot_recip;
+              for (uint32_t hap_idx = 0; hap_idx != 4; ++hap_idx) {
+                const uint32_t tbl_idx = 2 + 2 * hap_idx;
+                if (hap_ct_table[tbl_idx] + hap_ct_table[tbl_idx + 1] < maf_thresh) {
+                  hap_ct_table[0] -= hap_ct_table[tbl_idx];
+                  hap_ct_table[1] -= hap_ct_table[tbl_idx + 1];
+                  tot_recip -= hap_ct_table[tbl_idx] + hap_ct_table[tbl_idx + 1];
+                }
+              }
+              tot_recip = 1.0 / tot_recip;
+              // A1A1, A2A1, A1A2, A2A2, in PLINK 1.x's output order.
+              const uint32_t hap_tbl_idxs[4] = {2, 6, 4, 8};
+              const char* hap_prev_alleles[4] = {prev_a1, prev_a2, prev_a1, prev_a2};
+              const char* hap_next_alleles[4] = {next_a1, next_a1, next_a2, next_a2};
+              for (uint32_t row_idx = 0; row_idx != 4; ++row_idx) {
+                const uint32_t tbl_idx = hap_tbl_idxs[row_idx];
+                if (hap_ct_table[tbl_idx] + hap_ct_table[tbl_idx + 1] >= maf_thresh) {
+                  cswritep = TestMishapWriteLine(variant_id, hap_prev_alleles[row_idx], hap_next_alleles[row_idx], hap_ct_table, &(hap_ct_table[tbl_idx]), tot_recip, output_min_ln, flankstr, cswritep);
+                  if (unlikely(Cswrite(&css, &cswritep))) {
+                    goto TestMishap_ret_WRITE_FAIL;
+                  }
+                }
+              }
+            } else {
+              hap_ct_table[0] = 2 * S_CAST(int32_t, counts[0] + counts[1] + counts[2]);
+              hap_ct_table[1] = 2 * S_CAST(int32_t, counts[9] + counts[10] + counts[11]);
+              tot_recip = hap_ct_table[0] + hap_ct_table[1];
+              if (tot_recip == 0.0) {
+                goto TestMishap_next_variant;
+              }
+              orig_cmiss_tot = hap_ct_table[0];
+              orig_cnm_tot = hap_ct_table[1];
+              *strcpya(flankstr, variant_ids[next_uidx]) = '\0';
+              const double maf_thresh = min_maf * tot_recip;
+              hap_ct_table[2] = S_CAST(int32_t, counts[0] * 2 + counts[1]);
+              hap_ct_table[3] = S_CAST(int32_t, counts[9] * 2 + counts[10]);
+              hap_ct_table[4] = S_CAST(int32_t, counts[2] * 2 + counts[1]);
+              hap_ct_table[5] = S_CAST(int32_t, counts[11] * 2 + counts[10]);
+              if (hap_ct_table[4] + hap_ct_table[5] < maf_thresh) {
+                hap_ct_table[0] = hap_ct_table[2];
+                hap_ct_table[1] = hap_ct_table[3];
+                tot_recip = hap_ct_table[2] + hap_ct_table[3];
+              } else if (hap_ct_table[2] + hap_ct_table[3] < maf_thresh) {
+                hap_ct_table[0] = hap_ct_table[4];
+                hap_ct_table[1] = hap_ct_table[5];
+                tot_recip = hap_ct_table[4] + hap_ct_table[5];
+              }
+              tot_recip = 1.0 / tot_recip;
+              if (hap_ct_table[2] + hap_ct_table[3] >= maf_thresh) {
+                cswritep = TestMishapWriteLine(variant_id, nullptr, next_a1, hap_ct_table, &(hap_ct_table[2]), tot_recip, output_min_ln, flankstr, cswritep);
+                if (unlikely(Cswrite(&css, &cswritep))) {
+                  goto TestMishap_ret_WRITE_FAIL;
+                }
+              }
+              if (hap_ct_table[4] + hap_ct_table[5] >= maf_thresh) {
+                cswritep = TestMishapWriteLine(variant_id, nullptr, next_a2, hap_ct_table, &(hap_ct_table[4]), tot_recip, output_min_ln, flankstr, cswritep);
+                if (unlikely(Cswrite(&css, &cswritep))) {
+                  goto TestMishap_ret_WRITE_FAIL;
+                }
+              }
+            }
+          } else {
+            hap_ct_table[0] = 2 * S_CAST(int32_t, counts[0] + counts[3] + counts[6]);
+            hap_ct_table[1] = 2 * S_CAST(int32_t, counts[9] + counts[12] + counts[15]);
+            tot_recip = hap_ct_table[0] + hap_ct_table[1];
+            if (tot_recip == 0.0) {
+              goto TestMishap_next_variant;
+            }
+            orig_cmiss_tot = hap_ct_table[0];
+            orig_cnm_tot = hap_ct_table[1];
+            *strcpya(flankstr, variant_ids[chr_variant_uidxs[cidx - 1]]) = '\0';
+            const double maf_thresh = min_maf * tot_recip;
+            hap_ct_table[2] = S_CAST(int32_t, counts[0] * 2 + counts[3]);
+            hap_ct_table[3] = S_CAST(int32_t, counts[9] * 2 + counts[12]);
+            hap_ct_table[4] = S_CAST(int32_t, counts[6] * 2 + counts[3]);
+            hap_ct_table[5] = S_CAST(int32_t, counts[15] * 2 + counts[12]);
+            if (hap_ct_table[4] + hap_ct_table[5] < maf_thresh) {
+              hap_ct_table[0] = hap_ct_table[2];
+              hap_ct_table[1] = hap_ct_table[3];
+              tot_recip = hap_ct_table[2] + hap_ct_table[3];
+            } else if (hap_ct_table[2] + hap_ct_table[3] < maf_thresh) {
+              hap_ct_table[0] = hap_ct_table[4];
+              hap_ct_table[1] = hap_ct_table[5];
+              tot_recip = hap_ct_table[4] + hap_ct_table[5];
+            }
+            tot_recip = 1.0 / tot_recip;
+            if (hap_ct_table[2] + hap_ct_table[3] >= maf_thresh) {
+              cswritep = TestMishapWriteLine(variant_id, prev_a1, nullptr, hap_ct_table, &(hap_ct_table[2]), tot_recip, output_min_ln, flankstr, cswritep);
+              if (unlikely(Cswrite(&css, &cswritep))) {
+                goto TestMishap_ret_WRITE_FAIL;
+              }
+            }
+            if (hap_ct_table[4] + hap_ct_table[5] >= maf_thresh) {
+              cswritep = TestMishapWriteLine(variant_id, prev_a2, nullptr, hap_ct_table, &(hap_ct_table[4]), tot_recip, output_min_ln, flankstr, cswritep);
+              if (unlikely(Cswrite(&css, &cswritep))) {
+                goto TestMishap_ret_WRITE_FAIL;
+              }
+            }
+          }
+          // The HETERO row counts samples, not haplotypes, hence the halving.
+          hap_ct_table[0] = orig_cmiss_tot * 0.5;
+          hap_ct_table[1] = orig_cnm_tot * 0.5;
+          hap_ct_table[2] = S_CAST(int32_t, counts[1] + counts[3] + counts[4] + counts[5] + counts[7]);
+          hap_ct_table[3] = S_CAST(int32_t, counts[10] + counts[12] + counts[13] + counts[14] + counts[16]);
+          cswritep = TestMishapWriteLine(variant_id, "HETERO", nullptr, hap_ct_table, &(hap_ct_table[2]), 1.0 / (hap_ct_table[0] + hap_ct_table[1]), output_min_ln, flankstr, cswritep);
+          if (unlikely(Cswrite(&css, &cswritep))) {
+            goto TestMishap_ret_WRITE_FAIL;
+          }
+          ++inspected_ct;
+        }
+      TestMishap_next_variant:
+        {
+          uintptr_t* tmp_genovec = prev_genovec;
+          prev_genovec = cur_genovec;
+          cur_genovec = next_genovec;
+          next_genovec = tmp_genovec;
+        }
+        missing_ct_cur = missing_ct_next;
+        have_prev = 1;
+      }
+    }
+    if (unlikely(CswriteCloseNull(&css, cswritep))) {
+      goto TestMishap_ret_WRITE_FAIL;
+    }
+    logprintfww("--test-mishap: %u loc%s checked, report written to %s .\n", inspected_ct, (inspected_ct == 1)? "us" : "i", outname);
+  }
+  while (0) {
+  TestMishap_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  TestMishap_ret_PGR_FAIL:
+    PgenErrPrintN(reterr);
+    break;
+  TestMishap_ret_WRITE_FAIL:
+    reterr = kPglRetWriteFail;
+    break;
+  TestMishap_ret_INCONSISTENT_INPUT:
+    reterr = kPglRetInconsistentInput;
+    break;
+  }
+ TestMishap_ret_1:
+  CswriteCloseCond(&css, cswritep);
+  BigstackReset(bigstack_mark);
+  return reterr;
+}
+
+void InitTwolocus(TwolocusInfo* tlip) {
+  tlip->mkr1 = nullptr;
+  tlip->mkr2 = nullptr;
+  tlip->output_zst = 0;
+}
+
+void CleanupTwolocus(TwolocusInfo* tlip) {
+  free_cond(tlip->mkr1);
+  free_cond(tlip->mkr2);
+}
+
+// --twolocus: joint genotype counts for a pair of variants.  PLINK 1.x writes
+// a fixed-width human-readable report with marginals; plink2 has no
+// fixed-width output anywhere else, so this is a table instead, and the
+// marginals are left to the reader since every count that produces them is
+// present.
+PglErr TwolocusReport(const uintptr_t* sample_include, const uintptr_t* variant_include, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const PhenoCol* pheno_cols, const char* pheno_names, const char* mkr1, const char* mkr2, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t variant_ct, uint32_t pheno_ct, uintptr_t max_pheno_name_blen, uint32_t output_zst, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  char* cswritep = nullptr;
+  CompressStreamState css;
+  PreinitCstream(&css);
+  PglErr reterr = kPglRetSuccess;
+  {
+    const char* mkr_names[2];
+    mkr_names[0] = mkr1;
+    mkr_names[1] = mkr2;
+    // Two IDs to resolve, so a linear scan is cheaper than standing up a hash
+    // table; it also catches duplicate IDs, which the report cannot resolve.
+    uint32_t variant_uidxs[2] = {UINT32_MAX, UINT32_MAX};
+    {
+      uintptr_t variant_uidx_base = 0;
+      uintptr_t cur_bits = variant_include[0];
+      for (uint32_t variant_idx = 0; variant_idx != variant_ct; ++variant_idx) {
+        const uint32_t variant_uidx = BitIter1(variant_include, &variant_uidx_base, &cur_bits);
+        const char* cur_variant_id = variant_ids[variant_uidx];
+        for (uint32_t var_idx = 0; var_idx != 2; ++var_idx) {
+          if (!strcmp(cur_variant_id, mkr_names[var_idx])) {
+            if (unlikely(variant_uidxs[var_idx] != UINT32_MAX)) {
+              logerrprintfww("Error: --twolocus variant ID '%s' appears multiple times.\n", mkr_names[var_idx]);
+              goto TwolocusReport_ret_INCONSISTENT_INPUT;
+            }
+            variant_uidxs[var_idx] = variant_uidx;
+          }
+        }
+      }
+    }
+    for (uint32_t var_idx = 0; var_idx != 2; ++var_idx) {
+      const uint32_t cur_uidx = variant_uidxs[var_idx];
+      if (unlikely(cur_uidx == UINT32_MAX)) {
+        logerrprintfww("Error: --twolocus variant '%s' not found.\n", mkr_names[var_idx]);
+        goto TwolocusReport_ret_INCONSISTENT_INPUT;
+      }
+      if (unlikely(allele_idx_offsets && (allele_idx_offsets[cur_uidx + 1] != allele_idx_offsets[cur_uidx] + 2))) {
+        logerrprintfww("Error: --twolocus variant '%s' is multiallelic.\n", mkr_names[var_idx]);
+        goto TwolocusReport_ret_INCONSISTENT_INPUT;
+      }
+    }
+
+    const uint32_t raw_sample_ctl = BitCtToWordCt(raw_sample_ct);
+    uint32_t* sample_include_cumulative_popcounts;
+    uintptr_t* genovecs[2];
+    if (unlikely(bigstack_alloc_u32(raw_sample_ctl, &sample_include_cumulative_popcounts) ||
+                 bigstack_alloc_w(NypCtToWordCt(sample_ct), &(genovecs[0])) ||
+                 bigstack_alloc_w(NypCtToWordCt(sample_ct), &(genovecs[1])))) {
+      goto TwolocusReport_ret_NOMEM;
+    }
+    FillCumulativePopcounts(sample_include, raw_sample_ctl, sample_include_cumulative_popcounts);
+    PgrSampleSubsetIndex pssi;
+    PgrSetSampleSubsetIndex(sample_include_cumulative_popcounts, simple_pgrp, &pssi);
+    for (uint32_t var_idx = 0; var_idx != 2; ++var_idx) {
+      reterr = PgrGet(sample_include, pssi, sample_ct, variant_uidxs[var_idx], simple_pgrp, genovecs[var_idx]);
+      if (unlikely(reterr)) {
+        PgenErrPrintNV(reterr, variant_uidxs[var_idx]);
+        goto TwolocusReport_ret_1;
+      }
+    }
+
+    // Case/control split, when a case/control phenotype is available; PLINK
+    // 1.x always reports all three groups.
+    const PhenoCol* cc_pheno_col = nullptr;
+    const char* cc_pheno_name = nullptr;
+    for (uint32_t pheno_idx = 0; pheno_idx != pheno_ct; ++pheno_idx) {
+      if (pheno_cols[pheno_idx].type_code == kPhenoDtypeCc) {
+        cc_pheno_col = &(pheno_cols[pheno_idx]);
+        cc_pheno_name = &(pheno_names[pheno_idx * max_pheno_name_blen]);
+        break;
+      }
+    }
+    const uint32_t group_ct = cc_pheno_col? 3 : 1;
+    // [group][geno1 * 4 + geno2]
+    uint64_t counts[3][16];
+    for (uint32_t group_idx = 0; group_idx != 3; ++group_idx) {
+      for (uint32_t uii = 0; uii != 16; ++uii) {
+        counts[group_idx][uii] = 0;
+      }
+    }
+    {
+      uintptr_t sample_uidx_base = 0;
+      uintptr_t cur_bits = sample_include[0];
+      for (uint32_t sample_idx = 0; sample_idx != sample_ct; ++sample_idx) {
+        const uintptr_t sample_uidx = BitIter1(sample_include, &sample_uidx_base, &cur_bits);
+        const uint32_t geno1 = GetNyparrEntry(genovecs[0], sample_idx);
+        const uint32_t geno2 = GetNyparrEntry(genovecs[1], sample_idx);
+        const uint32_t cell = geno1 * 4 + geno2;
+        counts[0][cell] += 1;
+        if (cc_pheno_col && IsSet(cc_pheno_col->nonmiss, sample_uidx)) {
+          counts[1 + (1 - IsSet(cc_pheno_col->data.cc, sample_uidx))][cell] += 1;
+        }
+      }
+    }
+
+    const uintptr_t allele_idx_offset_base0 = allele_idx_offsets? allele_idx_offsets[variant_uidxs[0]] : (variant_uidxs[0] * 2);
+    const uintptr_t allele_idx_offset_base1 = allele_idx_offsets? allele_idx_offsets[variant_uidxs[1]] : (variant_uidxs[1] * 2);
+    const char* ref0 = allele_storage[allele_idx_offset_base0];
+    const char* alt0 = allele_storage[allele_idx_offset_base0 + 1];
+    const char* ref1 = allele_storage[allele_idx_offset_base1];
+    const char* alt1 = allele_storage[allele_idx_offset_base1 + 1];
+    const uintptr_t overflow_buf_size = kCompressStreamBlock + 4 * kMaxIdSlen + 256;
+    OutnameZstSet(".twolocus", output_zst, outname_end);
+    reterr = InitCstreamAlloc(outname, 0, output_zst, max_thread_ct, overflow_buf_size, &css, &cswritep);
+    if (unlikely(reterr)) {
+      goto TwolocusReport_ret_1;
+    }
+    cswritep = strcpya_k(cswritep, "#GROUP\tID1\tGT1\tID2\tGT2\tCT\tFREQ");
+    AppendBinaryEoln(&cswritep);
+    const char* group_names[3] = {"ALL", "CASE", "CTRL"};
+    for (uint32_t group_idx = 0; group_idx != group_ct; ++group_idx) {
+      uint64_t group_total = 0;
+      for (uint32_t uii = 0; uii != 16; ++uii) {
+        group_total += counts[group_idx][uii];
+      }
+      const double tot_recip = group_total? (1.0 / u63tod(group_total)) : 0.0;
+      // plink2 nyp order is hom-REF, het, hom-ALT, missing.
+      for (uint32_t geno1 = 0; geno1 != 4; ++geno1) {
+        for (uint32_t geno2 = 0; geno2 != 4; ++geno2) {
+          cswritep = strcpyax(cswritep, group_names[group_idx], '\t');
+          cswritep = strcpyax(cswritep, variant_ids[variant_uidxs[0]], '\t');
+          if (geno1 == 3) {
+            *cswritep++ = '.';
+          } else {
+            cswritep = strcpyax(cswritep, (geno1 == 0)? ref0 : alt0, '/');
+            cswritep = strcpya(cswritep, (geno1 == 2)? alt0 : ref0);
+          }
+          *cswritep++ = '\t';
+          cswritep = strcpyax(cswritep, variant_ids[variant_uidxs[1]], '\t');
+          if (geno2 == 3) {
+            *cswritep++ = '.';
+          } else {
+            cswritep = strcpyax(cswritep, (geno2 == 0)? ref1 : alt1, '/');
+            cswritep = strcpya(cswritep, (geno2 == 2)? alt1 : ref1);
+          }
+          *cswritep++ = '\t';
+          const uint64_t cur_ct = counts[group_idx][geno1 * 4 + geno2];
+          cswritep = i64toa(S_CAST(int64_t, cur_ct), cswritep);
+          *cswritep++ = '\t';
+          cswritep = dtoa_g(u63tod(cur_ct) * tot_recip, cswritep);
+          AppendBinaryEoln(&cswritep);
+          if (unlikely(Cswrite(&css, &cswritep))) {
+            goto TwolocusReport_ret_WRITE_FAIL;
+          }
+        }
+      }
+    }
+    if (unlikely(CswriteCloseNull(&css, cswritep))) {
+      goto TwolocusReport_ret_WRITE_FAIL;
+    }
+    if (cc_pheno_col) {
+      logprintfww("--twolocus: Joint genotype counts for '%s' and '%s' written to %s (case/control split on phenotype '%s').\n", mkr1, mkr2, outname, cc_pheno_name);
+    } else {
+      logprintfww("--twolocus: Joint genotype counts for '%s' and '%s' written to %s .\n", mkr1, mkr2, outname);
+    }
+  }
+  while (0) {
+  TwolocusReport_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  TwolocusReport_ret_WRITE_FAIL:
+    reterr = kPglRetWriteFail;
+    break;
+  TwolocusReport_ret_INCONSISTENT_INPUT:
+    reterr = kPglRetInconsistentInput;
+    break;
+  }
+ TwolocusReport_ret_1:
+  CswriteCloseCond(&css, cswritep);
+  BigstackReset(bigstack_mark);
+  return reterr;
+}
+
+void InitTag(TagInfo* tip) {
+  tip->tag_fname = nullptr;
+  tip->list_all = 0;
+  tip->mode2 = 0;
+  tip->bp_radius = 250000;
+  tip->output_zst = 0;
+  tip->r2_thresh = 0.8;
+}
+
+void CleanupTag(TagInfo* tip) {
+  free_cond(tip->tag_fname);
+}
+
+// --show-tags: for each variant, the nearby variants it is in strong LD with.
+// Same window-and-r^2 shape as --ld-score: genotypes are held as the
+// hom/ref2het bitvector pair the pairwise kernels consume, in a ring sized to
+// the widest window.
+typedef struct TagCtxStruct {
+  const uint32_t* variant_bps;
+  const uint32_t* chr_variant_uidxs;
+  uint32_t chr_variant_ct;
+  uint32_t founder_ct;
+  uint32_t bp_radius;
+  uintptr_t variant_buf_word_ct;
+  uint32_t ring_size;
+  const uintptr_t* genobufs;
+  const VariantAggs* vaggs;
+} TagCtx;
+
+static uint32_t TagWindowStart(const TagCtx* ctx, uint32_t cidx) {
+  const uint32_t* uidxs = ctx->chr_variant_uidxs;
+  const uint32_t cur_bp = ctx->variant_bps[uidxs[cidx]];
+  uint32_t start = 0;
+  while ((start < cidx) && (cur_bp - ctx->variant_bps[uidxs[start]] > ctx->bp_radius)) {
+    ++start;
+  }
+  return start;
+}
+
+static uint32_t TagWindowEnd(const TagCtx* ctx, uint32_t cidx) {
+  const uint32_t* uidxs = ctx->chr_variant_uidxs;
+  const uint32_t cur_bp = ctx->variant_bps[uidxs[cidx]];
+  uint32_t end = ctx->chr_variant_ct;
+  while ((end > cidx + 1) && (ctx->variant_bps[uidxs[end - 1]] - cur_bp > ctx->bp_radius)) {
+    --end;
+  }
+  return end;
+}
+
+// Unphased r^2 between two ring slots, with the integer accumulators
+// --indep-pairwise uses.  Negative when the pair has too little in common for
+// the ratio to be defined.
+static double TagPairR2(const TagCtx* ctx, uint32_t slot0, uint32_t slot1) {
+  const uint32_t founder_ct = ctx->founder_ct;
+  const uintptr_t stride = ctx->variant_buf_word_ct;
+  const uintptr_t* geno0 = &(ctx->genobufs[slot0 * stride]);
+  const uintptr_t* geno1 = &(ctx->genobufs[slot1 * stride]);
+  const VariantAggs* vaggs0 = &(ctx->vaggs[slot0]);
+  uint32_t cur_nm_ct = vaggs0->nm_ct;
+  int32_t cur_first_sum = vaggs0->sum;
+  uint32_t cur_first_ssq = vaggs0->ssq;
+  int32_t second_sum;
+  uint32_t second_ssq;
+  int32_t cur_dotprod;
+  ComputeIndepPairwiseR2Components(geno0, geno1, &(ctx->vaggs[slot1]), founder_ct, &cur_nm_ct, &cur_first_sum, &cur_first_ssq, &second_sum, &second_ssq, &cur_dotprod);
+  if (cur_nm_ct < 2) {
+    return -1.0;
+  }
+  const double cov12 = S_CAST(double, cur_dotprod * S_CAST(int64_t, cur_nm_ct) - S_CAST(int64_t, cur_first_sum) * second_sum);
+  const double variance1 = S_CAST(double, cur_first_ssq * S_CAST(int64_t, cur_nm_ct) - S_CAST(int64_t, cur_first_sum) * cur_first_sum);
+  const double variance2 = S_CAST(double, second_ssq * S_CAST(int64_t, cur_nm_ct) - S_CAST(int64_t, second_sum) * second_sum);
+  if ((variance1 <= 0.0) || (variance2 <= 0.0)) {
+    return -1.0;
+  }
+  return cov12 * cov12 / (variance1 * variance2);
+}
+
+PglErr ShowTags(const uintptr_t* orig_variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const uintptr_t* founder_info, const char* tag_fname, uint32_t list_all, uint32_t mode2, uint32_t bp_radius, double r2_thresh, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t raw_sample_ct, uint32_t founder_ct, uint32_t max_variant_id_slen, uint32_t output_zst, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  char* cswritep = nullptr;
+  CompressStreamState css;
+  PreinitCstream(&css);
+  TextStream txs;
+  PreinitTextStream(&txs);
+  PglErr reterr = kPglRetSuccess;
+  {
+    if (unlikely(founder_ct < 2)) {
+      logerrputs("Error: --show-tags requires at least two founders.\n");
+      goto ShowTags_ret_INCONSISTENT_INPUT;
+    }
+    const uint32_t all_mode = (tag_fname == nullptr);
+    const uint32_t write_tag_list = all_mode || list_all;
+    const uint32_t raw_variant_ctl = BitCtToWordCt(raw_variant_ct);
+    uintptr_t* variant_include;
+    if (unlikely(bigstack_alloc_w(raw_variant_ctl, &variant_include))) {
+      goto ShowTags_ret_NOMEM;
+    }
+    memcpy(variant_include, orig_variant_include, raw_variant_ctl * sizeof(intptr_t));
+    // r^2 here is the biallelic unphased statistic, as in PLINK 1.x.
+    uint32_t skip_ct = 0;
+    if (allele_idx_offsets) {
+      uintptr_t variant_uidx_base = 0;
+      uintptr_t cur_bits = orig_variant_include[0];
+      for (uint32_t vidx = 0; vidx != variant_ct; ++vidx) {
+        const uint32_t variant_uidx = BitIter1(orig_variant_include, &variant_uidx_base, &cur_bits);
+        if (allele_idx_offsets[variant_uidx + 1] - allele_idx_offsets[variant_uidx] != 2) {
+          ClearBit(variant_uidx, variant_include);
+          ++skip_ct;
+        }
+      }
+    }
+    for (uint32_t chr_fo_idx = 0; chr_fo_idx != cip->chr_ct; ++chr_fo_idx) {
+      const uint32_t chr_idx = cip->chr_file_order[chr_fo_idx];
+      if (!IsSet(cip->haploid_mask, chr_idx)) {
+        continue;
+      }
+      const uint32_t chr_vidx_start = cip->chr_fo_vidx_start[chr_fo_idx];
+      const uint32_t chr_vidx_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+      skip_ct += PopcountBitRange(variant_include, chr_vidx_start, chr_vidx_end);
+      ClearBitsNz(chr_vidx_start, chr_vidx_end, variant_include);
+    }
+    const uint32_t kept_variant_ct = PopcountWords(variant_include, raw_variant_ctl);
+    if (unlikely(!kept_variant_ct)) {
+      logerrputs("Error: --show-tags: No variants remaining.\n");
+      goto ShowTags_ret_INCONSISTENT_INPUT;
+    }
+
+    uintptr_t* target_variants = nullptr;
+    if (!all_mode) {
+      if (unlikely(bigstack_calloc_w(raw_variant_ctl, &target_variants))) {
+        goto ShowTags_ret_NOMEM;
+      }
+      uint32_t* variant_id_htable;
+      uint32_t* htable_dup_base;
+      uint32_t variant_id_htable_size;
+      uint32_t dup_ct;
+      reterr = AllocAndPopulateIdHtableMt(variant_include, variant_ids, kept_variant_ct, bigstack_left() / 8, max_thread_ct, &variant_id_htable, &htable_dup_base, &variant_id_htable_size, &dup_ct);
+      if (unlikely(reterr)) {
+        goto ShowTags_ret_1;
+      }
+      reterr = SizeAndInitTextStream(tag_fname, bigstack_left() / 4, 1, &txs);
+      if (unlikely(reterr)) {
+        goto ShowTags_ret_TSTREAM_FAIL;
+      }
+      uint32_t miss_ct = 0;
+      while (1) {
+        const char* line_start = TextGet(&txs);
+        if (!line_start) {
+          break;
+        }
+        const char* token_end = CurTokenEnd(line_start);
+        const uint32_t id_slen = token_end - line_start;
+        if (mode2) {
+          // Two-column input; a variant is a target only when its second
+          // column is exactly "1".  PLINK 1.x ignores every other line.
+          const char* second_token = FirstNonTspace(token_end);
+          if ((*second_token != '1') || (!IsSpaceOrEoln(second_token[1]))) {
+            continue;
+          }
+        }
+        uint32_t llidx;
+        const uint32_t variant_uidx = VariantIdDupHtableFind(line_start, variant_ids, variant_id_htable, htable_dup_base, id_slen, variant_id_htable_size, max_variant_id_slen, &llidx);
+        if (variant_uidx == UINT32_MAX) {
+          ++miss_ct;
+          continue;
+        }
+        SetBit(variant_uidx, target_variants);
+      }
+      if (unlikely(TextStreamErrcode2(&txs, &reterr))) {
+        goto ShowTags_ret_TSTREAM_FAIL;
+      }
+      if (unlikely(CleanupTextStream2(tag_fname, &txs, &reterr))) {
+        goto ShowTags_ret_1;
+      }
+      if (miss_ct) {
+        logerrprintf("Warning: %u --show-tags variant ID%s not found in the dataset.\n", miss_ct, (miss_ct == 1)? "" : "s");
+      }
+    }
+
+    // A variant tags itself, so the file-mode output starts as the target set.
+    uintptr_t* tagging_variants = nullptr;
+    if (!all_mode) {
+      if (unlikely(bigstack_alloc_w(raw_variant_ctl, &tagging_variants))) {
+        goto ShowTags_ret_NOMEM;
+      }
+      memcpy(tagging_variants, target_variants, raw_variant_ctl * sizeof(intptr_t));
+    }
+
+    const uint32_t raw_sample_ctl = BitCtToWordCt(raw_sample_ct);
+    uint32_t* founder_info_cumulative_popcounts;
+    uint32_t* chr_variant_uidxs;
+    uintptr_t* genovec;
+    if (unlikely(bigstack_alloc_u32(raw_sample_ctl, &founder_info_cumulative_popcounts) ||
+                 bigstack_alloc_u32(kept_variant_ct, &chr_variant_uidxs) ||
+                 bigstack_alloc_w(NypCtToWordCt(founder_ct), &genovec))) {
+      goto ShowTags_ret_NOMEM;
+    }
+    FillCumulativePopcounts(founder_info, raw_sample_ctl, founder_info_cumulative_popcounts);
+    PgrSampleSubsetIndex pssi;
+    PgrSetSampleSubsetIndex(founder_info_cumulative_popcounts, simple_pgrp, &pssi);
+
+    TagCtx ctx;
+    ctx.variant_bps = variant_bps;
+    ctx.chr_variant_uidxs = chr_variant_uidxs;
+    ctx.founder_ct = founder_ct;
+    ctx.bp_radius = bp_radius;
+
+    uint32_t max_window_ct = 1;
+    {
+      uintptr_t variant_uidx_base = 0;
+      uintptr_t cur_bits = variant_include[0];
+      for (uint32_t chr_fo_idx = 0; chr_fo_idx != cip->chr_ct; ++chr_fo_idx) {
+        const uint32_t chr_vidx_start = cip->chr_fo_vidx_start[chr_fo_idx];
+        const uint32_t chr_vidx_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+        const uint32_t chr_variant_ct = PopcountBitRange(variant_include, chr_vidx_start, chr_vidx_end);
+        if (!chr_variant_ct) {
+          continue;
+        }
+        for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+          chr_variant_uidxs[cidx] = BitIter1(variant_include, &variant_uidx_base, &cur_bits);
+        }
+        ctx.chr_variant_ct = chr_variant_ct;
+        for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+          const uint32_t cur_window_ct = TagWindowEnd(&ctx, cidx) - TagWindowStart(&ctx, cidx);
+          if (cur_window_ct > max_window_ct) {
+            max_window_ct = cur_window_ct;
+          }
+        }
+      }
+    }
+    const uint32_t founder_ctaw = BitCtToAlignedWordCt(founder_ct);
+    const uintptr_t variant_buf_word_ct = 2 * founder_ctaw;
+    ctx.variant_buf_word_ct = variant_buf_word_ct;
+    const uint32_t ring_size = max_window_ct;
+    ctx.ring_size = ring_size;
+    uintptr_t* genobufs;
+    VariantAggs* vaggs;
+    if (unlikely(bigstack_alloc_w(S_CAST(uintptr_t, ring_size) * variant_buf_word_ct, &genobufs) ||
+                 BIGSTACK_ALLOC_X(VariantAggs, ring_size, &vaggs))) {
+      goto ShowTags_ret_NOMEM;
+    }
+    ctx.genobufs = genobufs;
+    ctx.vaggs = vaggs;
+
+    if (write_tag_list) {
+      const uint32_t max_chr_blen = GetMaxChrSlen(cip) + 1;
+      const uintptr_t overflow_buf_size = kCompressStreamBlock + max_chr_blen + 256;
+      OutnameZstSet(".tags.list", output_zst, outname_end);
+      reterr = InitCstreamAlloc(outname, 0, output_zst, max_thread_ct, overflow_buf_size, &css, &cswritep);
+      if (unlikely(reterr)) {
+        goto ShowTags_ret_1;
+      }
+      cswritep = strcpya_k(cswritep, "#ID\tCHROM\tPOS\tNTAG\tLEFT\tRIGHT\tKBSPAN\tTAGS");
+      AppendBinaryEoln(&cswritep);
+    }
+    char* chr_buf;
+    const uint32_t max_chr_blen2 = GetMaxChrSlen(cip) + 1;
+    if (unlikely(bigstack_alloc_c(max_chr_blen2, &chr_buf))) {
+      goto ShowTags_ret_NOMEM;
+    }
+
+    uintptr_t variant_uidx_base = 0;
+    uintptr_t cur_bits = variant_include[0];
+    for (uint32_t chr_fo_idx = 0; chr_fo_idx != cip->chr_ct; ++chr_fo_idx) {
+      const uint32_t chr_vidx_start = cip->chr_fo_vidx_start[chr_fo_idx];
+      const uint32_t chr_vidx_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+      const uint32_t chr_variant_ct = PopcountBitRange(variant_include, chr_vidx_start, chr_vidx_end);
+      if (!chr_variant_ct) {
+        continue;
+      }
+      for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+        chr_variant_uidxs[cidx] = BitIter1(variant_include, &variant_uidx_base, &cur_bits);
+      }
+      ctx.chr_variant_ct = chr_variant_ct;
+      char* chr_name_end = chrtoa(cip, cip->chr_file_order[chr_fo_idx], chr_buf);
+      const uint32_t chr_slen = chr_name_end - chr_buf;
+      uint32_t loaded_end = 0;
+      for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+        const uint32_t window_start = TagWindowStart(&ctx, cidx);
+        const uint32_t window_end = TagWindowEnd(&ctx, cidx);
+        if (loaded_end < window_start) {
+          loaded_end = window_start;
+        }
+        for (; loaded_end != window_end; ++loaded_end) {
+          const uint32_t slot_idx = loaded_end % ring_size;
+          uintptr_t* cur_genobuf = &(genobufs[slot_idx * variant_buf_word_ct]);
+          reterr = PgrGet(founder_info, pssi, founder_ct, chr_variant_uidxs[loaded_end], simple_pgrp, genovec);
+          if (unlikely(reterr)) {
+            PgenErrPrintNV(reterr, chr_variant_uidxs[loaded_end]);
+            goto ShowTags_ret_1;
+          }
+          ZeroTrailingNyps(founder_ct, genovec);
+          SplitHomRef2het(genovec, founder_ct, cur_genobuf, &(cur_genobuf[founder_ctaw]));
+          uint32_t nm_ct;
+          uint32_t plusone_ct;
+          uint32_t minusone_ct;
+          FillVaggs(cur_genobuf, &(cur_genobuf[founder_ctaw]), BitCtToWordCt(founder_ct), &(vaggs[slot_idx]), &nm_ct, &plusone_ct, &minusone_ct);
+        }
+        const uint32_t index_uidx = chr_variant_uidxs[cidx];
+        const uint32_t index_slot = cidx % ring_size;
+        // In file mode, --list-all reports the named variants only; 'all' mode
+        // reports every variant.
+        const uint32_t emit_row = write_tag_list && (all_mode || IsSet(target_variants, index_uidx));
+        uint32_t ntag = 0;
+        uint32_t left_bp = variant_bps[index_uidx];
+        uint32_t right_bp = left_bp;
+        char* tag_write_start = nullptr;
+        if (emit_row) {
+          cswritep = strcpyax(cswritep, variant_ids[index_uidx], '\t');
+          cswritep = memcpyax(cswritep, chr_buf, chr_slen, '\t');
+          cswritep = u32toa(variant_bps[index_uidx], cswritep);
+          tag_write_start = cswritep;
+        }
+        // Tag IDs go to a scratch buffer, since NTAG and the span have to be
+        // written before them.
+        unsigned char* tagbuf_mark = g_bigstack_base;
+        char* tagbuf = nullptr;
+        char* tag_iter = nullptr;
+        if (emit_row) {
+          const uintptr_t tagbuf_size = S_CAST(uintptr_t, window_end - window_start) * (kMaxIdSlen + 1) + 16;
+          if (unlikely(bigstack_alloc_c(tagbuf_size, &tagbuf))) {
+            goto ShowTags_ret_NOMEM;
+          }
+          tag_iter = tagbuf;
+        }
+        for (uint32_t other_cidx = window_start; other_cidx != window_end; ++other_cidx) {
+          if (other_cidx == cidx) {
+            continue;
+          }
+          const double cur_r2 = TagPairR2(&ctx, index_slot, other_cidx % ring_size);
+          if (cur_r2 < r2_thresh) {
+            continue;
+          }
+          const uint32_t other_uidx = chr_variant_uidxs[other_cidx];
+          ++ntag;
+          const uint32_t other_bp = variant_bps[other_uidx];
+          if (other_bp < left_bp) {
+            left_bp = other_bp;
+          }
+          if (other_bp > right_bp) {
+            right_bp = other_bp;
+          }
+          if (!all_mode) {
+            // The index variant tags other_cidx; in file mode we want the
+            // variants tagging a target.
+            if (IsSet(target_variants, other_uidx)) {
+              SetBit(index_uidx, tagging_variants);
+            }
+          }
+          if (emit_row) {
+            if (tag_iter != tagbuf) {
+              *tag_iter++ = '|';
+            }
+            tag_iter = strcpya(tag_iter, variant_ids[other_uidx]);
+          }
+        }
+        if (emit_row) {
+          cswritep = tag_write_start;
+          *cswritep++ = '\t';
+          cswritep = u32toa_x(ntag, '\t', cswritep);
+          cswritep = u32toa_x(left_bp, '\t', cswritep);
+          cswritep = u32toa_x(right_bp, '\t', cswritep);
+          cswritep = dtoa_g(u31tod(right_bp - left_bp + 1) / 1000.0, cswritep);
+          *cswritep++ = '\t';
+          if (!ntag) {
+            cswritep = strcpya_k(cswritep, "NONE");
+          } else {
+            cswritep = memcpya(cswritep, tagbuf, tag_iter - tagbuf);
+          }
+          AppendBinaryEoln(&cswritep);
+          if (unlikely(Cswrite(&css, &cswritep))) {
+            goto ShowTags_ret_WRITE_FAIL;
+          }
+        }
+        BigstackReset(tagbuf_mark);
+      }
+    }
+    if (write_tag_list) {
+      if (unlikely(CswriteCloseNull(&css, cswritep))) {
+        goto ShowTags_ret_WRITE_FAIL;
+      }
+      logprintfww("--show-tags: Per-variant tag lists written to %s .\n", outname);
+    }
+    if (!all_mode) {
+      OutnameZstSet(".tags", output_zst, outname_end);
+      reterr = InitCstreamAlloc(outname, 0, output_zst, max_thread_ct, kCompressStreamBlock + kMaxIdSlen + 64, &css, &cswritep);
+      if (unlikely(reterr)) {
+        goto ShowTags_ret_1;
+      }
+      const uint32_t tagging_ct = PopcountWords(tagging_variants, raw_variant_ctl);
+      if (!mode2) {
+        uintptr_t tag_uidx_base = 0;
+        uintptr_t tag_bits = tagging_variants[0];
+        for (uint32_t uii = 0; uii != tagging_ct; ++uii) {
+          const uint32_t cur_uidx = BitIter1(tagging_variants, &tag_uidx_base, &tag_bits);
+          cswritep = strcpya(cswritep, variant_ids[cur_uidx]);
+          AppendBinaryEoln(&cswritep);
+          if (unlikely(Cswrite(&css, &cswritep))) {
+            goto ShowTags_ret_WRITE_FAIL;
+          }
+        }
+      } else {
+        // Every retained variant is listed, with a 0/1 membership column.
+        uintptr_t variant_uidx_base = 0;
+        uintptr_t cur_bits = orig_variant_include[0];
+        for (uint32_t vidx = 0; vidx != variant_ct; ++vidx) {
+          const uint32_t variant_uidx = BitIter1(orig_variant_include, &variant_uidx_base, &cur_bits);
+          cswritep = strcpyax(cswritep, variant_ids[variant_uidx], '\t');
+          *cswritep++ = '0' + IsSet(tagging_variants, variant_uidx);
+          AppendBinaryEoln(&cswritep);
+          if (unlikely(Cswrite(&css, &cswritep))) {
+            goto ShowTags_ret_WRITE_FAIL;
+          }
+        }
+      }
+      if (unlikely(CswriteCloseNull(&css, cswritep))) {
+        goto ShowTags_ret_WRITE_FAIL;
+      }
+      logprintfww("--show-tags: %u tagging variant%s written to %s .\n", tagging_ct, (tagging_ct == 1)? "" : "s", outname);
+    }
+    if (skip_ct) {
+      logprintf("(%u multiallelic and/or haploid-chromosome variant%s skipped.)\n", skip_ct, (skip_ct == 1)? "" : "s");
+    }
+  }
+  while (0) {
+  ShowTags_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  ShowTags_ret_TSTREAM_FAIL:
+    TextStreamErrPrint("--show-tags file", &txs);
+    break;
+  ShowTags_ret_WRITE_FAIL:
+    reterr = kPglRetWriteFail;
+    break;
+  ShowTags_ret_INCONSISTENT_INPUT:
+    reterr = kPglRetInconsistentInput;
+    break;
+  }
+ ShowTags_ret_1:
+  CswriteCloseCond(&css, cswritep);
+  CleanupTextStream2("--show-tags file", &txs, &reterr);
+  BigstackReset(bigstack_mark);
+  return reterr;
+}
+
+void InitLdScore(LdScoreInfo* lsip) {
+  lsip->flags = kfLdScore0;
+  // LD Score regression's convention is a 1 cM radius, so that's the default.
+  // The variant-count and bp radii are here for the same reason --ld-window
+  // and --ld-window-kb are, and are off unless asked for.
+  lsip->var_ct_radius = 0x7fffffff;
+  lsip->bp_radius = UINT32_MAX;
+  lsip->cm_radius = 1.0;
+}
+
+// --ld-score: per-variant sum of unbiased r^2 with every variant in a window
+// around it, itself included.  This is the statistic LD Score regression
+// consumes.  The unbiased estimator is r^2 - (1 - r^2)/(n - 2), with n the
+// number of samples the pair actually has in common; the correction is what
+// makes a null pair's expected contribution zero rather than 1/n.
+//
+// The window is walked once per index variant rather than once per pair, so
+// each pair is evaluated twice.  That doubles the arithmetic and buys a
+// partition of the output with no shared accumulators, which is what lets
+// threads take disjoint index ranges of the same block.
+//
+// Genotypes are read once, by the main thread, into a ring buffer that the
+// worker threads only read from.  The ring holds one block of index variants
+// plus the widest window, so its size doesn't grow with the chromosome.
+
+typedef struct LdScoreCtxStruct {
+  const uint32_t* variant_bps;
+  const double* variant_cms;
+  const uint32_t* chr_variant_uidxs;
+  uint32_t chr_variant_ct;
+  uint32_t founder_ct;
+  uint32_t var_ct_radius;
+  uint32_t bp_radius;
+  double cm_radius;
+  uint32_t ring_size;
+  uintptr_t variant_buf_word_ct;
+
+  const uintptr_t* genobufs;
+  const VariantAggs* vaggs;
+
+  const uint32_t* thread_cidx_starts;
+  double* l2_results;
+  uint32_t* nobs_results;
+
+  uint32_t block_start;
+  uint32_t block_end;
+} LdScoreCtx;
+
+// First index cidx must be compared against.  Monotonic in cidx, which is what
+// lets the reader slide instead of reloading.
+static uint32_t LdScoreWindowStart(const LdScoreCtx* ctx, uint32_t cidx) {
+  const uint32_t* uidxs = ctx->chr_variant_uidxs;
+  uint32_t start = 0;
+  if (ctx->var_ct_radius < cidx) {
+    start = cidx - ctx->var_ct_radius;
+  }
+  if (ctx->bp_radius != UINT32_MAX) {
+    const uint32_t cur_bp = ctx->variant_bps[uidxs[cidx]];
+    while ((start < cidx) && (cur_bp - ctx->variant_bps[uidxs[start]] > ctx->bp_radius)) {
+      ++start;
+    }
+  }
+  if (ctx->variant_cms) {
+    const double cur_cm = ctx->variant_cms[uidxs[cidx]];
+    while ((start < cidx) && (cur_cm - ctx->variant_cms[uidxs[start]] > ctx->cm_radius)) {
+      ++start;
+    }
+  }
+  return start;
+}
+
+// One past the last index cidx must be compared against.  Also monotonic.
+static uint32_t LdScoreWindowEnd(const LdScoreCtx* ctx, uint32_t cidx) {
+  const uint32_t* uidxs = ctx->chr_variant_uidxs;
+  const uint32_t chr_variant_ct = ctx->chr_variant_ct;
+  uint32_t end = chr_variant_ct;
+  if (ctx->var_ct_radius < chr_variant_ct - cidx - 1) {
+    end = cidx + ctx->var_ct_radius + 1;
+  }
+  if (ctx->bp_radius != UINT32_MAX) {
+    const uint32_t cur_bp = ctx->variant_bps[uidxs[cidx]];
+    while ((end > cidx + 1) && (ctx->variant_bps[uidxs[end - 1]] - cur_bp > ctx->bp_radius)) {
+      --end;
+    }
+  }
+  if (ctx->variant_cms) {
+    const double cur_cm = ctx->variant_cms[uidxs[cidx]];
+    while ((end > cidx + 1) && (ctx->variant_cms[uidxs[end - 1]] - cur_cm > ctx->cm_radius)) {
+      --end;
+    }
+  }
+  return end;
+}
+
+// L2 for the index variants in [cidx_start, cidx_end).  Every variant it needs
+// is already in the ring.
+static void LdScoreRange(const LdScoreCtx* ctx, uint32_t cidx_start, uint32_t cidx_end) {
+  const uint32_t founder_ct = ctx->founder_ct;
+  const uintptr_t variant_buf_word_ct = ctx->variant_buf_word_ct;
+  const uint32_t ring_size = ctx->ring_size;
+  const uintptr_t* genobufs = ctx->genobufs;
+  const VariantAggs* vaggs = ctx->vaggs;
+  double* l2_results = ctx->l2_results;
+  uint32_t* nobs_results = ctx->nobs_results;
+  for (uint32_t cidx = cidx_start; cidx != cidx_end; ++cidx) {
+    const uint32_t index_slot = cidx % ring_size;
+    const VariantAggs* index_vaggs = &(vaggs[index_slot]);
+    // A monomorphic variant has no correlation with anything, so its LD Score
+    // is undefined rather than 1.
+    const double index_variance = S_CAST(double, index_vaggs->ssq * S_CAST(int64_t, index_vaggs->nm_ct) - S_CAST(int64_t, index_vaggs->sum) * index_vaggs->sum);
+    if (index_variance <= 0.0) {
+      l2_results[cidx] = -1.0;
+      nobs_results[cidx] = 0;
+      continue;
+    }
+    const uintptr_t* index_genobuf = &(genobufs[index_slot * variant_buf_word_ct]);
+    const uint32_t window_start = LdScoreWindowStart(ctx, cidx);
+    const uint32_t window_end = LdScoreWindowEnd(ctx, cidx);
+    // The self term is exactly 1: r^2 is 1 and the correction vanishes.
+    double l2 = 1.0;
+    uint32_t nobs = 1;
+    for (uint32_t other_cidx = window_start; other_cidx != window_end; ++other_cidx) {
+      if (other_cidx == cidx) {
+        continue;
+      }
+      const uint32_t other_slot = other_cidx % ring_size;
+      const uintptr_t* other_genobuf = &(genobufs[other_slot * variant_buf_word_ct]);
+      uint32_t cur_nm_ct = index_vaggs->nm_ct;
+      int32_t cur_first_sum = index_vaggs->sum;
+      uint32_t cur_first_ssq = index_vaggs->ssq;
+      int32_t second_sum;
+      uint32_t second_ssq;
+      int32_t cur_dotprod;
+      ComputeIndepPairwiseR2Components(index_genobuf, other_genobuf, &(vaggs[other_slot]), founder_ct, &cur_nm_ct, &cur_first_sum, &cur_first_ssq, &second_sum, &second_ssq, &cur_dotprod);
+      if (cur_nm_ct < 3) {
+        continue;
+      }
+      // These are all cur_nm_ct times their true values, which cancels in the
+      // ratio.
+      const double cov12 = S_CAST(double, cur_dotprod * S_CAST(int64_t, cur_nm_ct) - S_CAST(int64_t, cur_first_sum) * second_sum);
+      const double variance1 = S_CAST(double, cur_first_ssq * S_CAST(int64_t, cur_nm_ct) - S_CAST(int64_t, cur_first_sum) * cur_first_sum);
+      const double variance2 = S_CAST(double, second_ssq * S_CAST(int64_t, cur_nm_ct) - S_CAST(int64_t, second_sum) * second_sum);
+      if ((variance1 <= 0.0) || (variance2 <= 0.0)) {
+        continue;
+      }
+      double r2 = cov12 * cov12 / (variance1 * variance2);
+      if (r2 > 1.0) {
+        // Keeps rounding error in the division from pushing a perfectly
+        // correlated pair above 1, which would make the correction negative.
+        r2 = 1.0;
+      }
+      l2 += r2 - (1.0 - r2) / u31tod(cur_nm_ct - 2);
+      ++nobs;
+    }
+    l2_results[cidx] = l2;
+    nobs_results[cidx] = nobs;
+  }
+}
+
+THREAD_FUNC_DECL LdScoreThread(void* raw_arg) {
+  ThreadGroupFuncArg* arg = S_CAST(ThreadGroupFuncArg*, raw_arg);
+  const uintptr_t tidx = arg->tidx;
+  LdScoreCtx* ctx = S_CAST(LdScoreCtx*, arg->sharedp->context);
+  do {
+    LdScoreRange(ctx, ctx->thread_cidx_starts[tidx], ctx->thread_cidx_starts[tidx + 1]);
+  } while (!THREAD_BLOCK_FINISH(arg));
+  THREAD_RETURN;
+}
+
+PglErr LdScore(const uintptr_t* orig_variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const double* variant_cms, const uintptr_t* allele_idx_offsets, const AlleleCode* maj_alleles, const uintptr_t* founder_info, const LdScoreInfo* lsip, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t raw_sample_ct, uint32_t founder_ct, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  char* cswritep = nullptr;
+  CompressStreamState css;
+  ThreadGroup tg;
+  PreinitCstream(&css);
+  PreinitThreads(&tg);
+  LdScoreCtx ctx;
+  PglErr reterr = kPglRetSuccess;
+  {
+    if (unlikely(founder_ct < 3)) {
+      logerrputs("Error: --ld-score requires at least three founders.\n");
+      goto LdScore_ret_INCONSISTENT_INPUT;
+    }
+    const LdScoreFlags flags = lsip->flags;
+    const uint32_t use_cm = (lsip->cm_radius >= 0.0);
+    if (unlikely(use_cm && (!variant_cms))) {
+      logerrputs("Error: --ld-score's default 1 cM window requires nonzero CM coordinates.  Load\na .pvar/.bim with them (--cm-map may help), or set an explicit\n--ld-score-window-kb or --ld-score-window.\n");
+      goto LdScore_ret_INCONSISTENT_INPUT;
+    }
+
+    // Programs that consume ldsc output expect multiallelic variants to have
+    // been filtered out, so that is the default here.  'multiallelic' keeps
+    // them, handled the usual plink2 way: one allele, the most common by
+    // default, against all others.
+    const uint32_t keep_multiallelic = (lsip->flags / kfLdScoreMultiallelic) & 1;
+    const uint32_t raw_variant_ctl = BitCtToWordCt(raw_variant_ct);
+    uintptr_t* variant_include;
+    if (unlikely(bigstack_alloc_w(raw_variant_ctl, &variant_include))) {
+      goto LdScore_ret_NOMEM;
+    }
+    memcpy(variant_include, orig_variant_include, raw_variant_ctl * sizeof(intptr_t));
+    uint32_t multiallelic_skip_ct = 0;
+    if (allele_idx_offsets && (!keep_multiallelic)) {
+      uintptr_t variant_uidx_base = 0;
+      uintptr_t cur_bits = orig_variant_include[0];
+      for (uint32_t vidx = 0; vidx != variant_ct; ++vidx) {
+        const uint32_t variant_uidx = BitIter1(orig_variant_include, &variant_uidx_base, &cur_bits);
+        if (allele_idx_offsets[variant_uidx + 1] - allele_idx_offsets[variant_uidx] != 2) {
+          ClearBit(variant_uidx, variant_include);
+          ++multiallelic_skip_ct;
+        }
+      }
+    }
+    // Haploid chromosomes have no diploid r^2, and chrX needs the male/female
+    // split --r2-unphased performs; neither is in scope here yet.
+    uint32_t haploid_skip_ct = 0;
+    const uint32_t chr_ct = cip->chr_ct;
+    for (uint32_t chr_fo_idx = 0; chr_fo_idx != chr_ct; ++chr_fo_idx) {
+      const uint32_t chr_idx = cip->chr_file_order[chr_fo_idx];
+      if (!IsSet(cip->haploid_mask, chr_idx)) {
+        continue;
+      }
+      const uint32_t chr_vidx_start = cip->chr_fo_vidx_start[chr_fo_idx];
+      const uint32_t chr_vidx_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+      haploid_skip_ct += PopcountBitRange(variant_include, chr_vidx_start, chr_vidx_end);
+      ClearBitsNz(chr_vidx_start, chr_vidx_end, variant_include);
+    }
+    const uint32_t kept_variant_ct = PopcountWords(variant_include, raw_variant_ctl);
+    if (unlikely(!kept_variant_ct)) {
+      logerrputs("Error: --ld-score: No variants remaining.\n");
+      goto LdScore_ret_INCONSISTENT_INPUT;
+    }
+
+    const uint32_t raw_sample_ctl = BitCtToWordCt(raw_sample_ct);
+    uint32_t* founder_info_cumulative_popcounts;
+    uint32_t* chr_variant_uidxs;
+    uintptr_t* genovec;
+    double* l2_results;
+    uint32_t* nobs_results;
+    if (unlikely(bigstack_alloc_u32(raw_sample_ctl, &founder_info_cumulative_popcounts) ||
+                 bigstack_alloc_u32(kept_variant_ct, &chr_variant_uidxs) ||
+                 bigstack_alloc_w(NypCtToWordCt(founder_ct), &genovec) ||
+                 bigstack_alloc_d(kept_variant_ct, &l2_results) ||
+                 bigstack_alloc_u32(kept_variant_ct, &nobs_results))) {
+      goto LdScore_ret_NOMEM;
+    }
+    FillCumulativePopcounts(founder_info, raw_sample_ctl, founder_info_cumulative_popcounts);
+    PgrSampleSubsetIndex pssi;
+    PgrSetSampleSubsetIndex(founder_info_cumulative_popcounts, simple_pgrp, &pssi);
+
+    ctx.variant_bps = variant_bps;
+    ctx.variant_cms = use_cm? variant_cms : nullptr;
+    ctx.chr_variant_uidxs = chr_variant_uidxs;
+    ctx.founder_ct = founder_ct;
+    ctx.var_ct_radius = lsip->var_ct_radius;
+    ctx.bp_radius = lsip->bp_radius;
+    ctx.cm_radius = lsip->cm_radius;
+    ctx.l2_results = l2_results;
+    ctx.nobs_results = nobs_results;
+
+    // One pass to size the ring: both window ends are monotonic, so the widest
+    // window is found in linear time.
+    uint32_t max_window_ct = 1;
+    {
+      uintptr_t variant_uidx_base = 0;
+      uintptr_t cur_bits = variant_include[0];
+      for (uint32_t chr_fo_idx = 0; chr_fo_idx != chr_ct; ++chr_fo_idx) {
+        const uint32_t chr_vidx_start = cip->chr_fo_vidx_start[chr_fo_idx];
+        const uint32_t chr_vidx_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+        const uint32_t chr_variant_ct = PopcountBitRange(variant_include, chr_vidx_start, chr_vidx_end);
+        if (!chr_variant_ct) {
+          continue;
+        }
+        for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+          chr_variant_uidxs[cidx] = BitIter1(variant_include, &variant_uidx_base, &cur_bits);
+        }
+        ctx.chr_variant_ct = chr_variant_ct;
+        for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+          const uint32_t cur_window_ct = LdScoreWindowEnd(&ctx, cidx) - LdScoreWindowStart(&ctx, cidx);
+          if (cur_window_ct > max_window_ct) {
+            max_window_ct = cur_window_ct;
+          }
+        }
+      }
+    }
+
+    const uint32_t founder_ctaw = BitCtToAlignedWordCt(founder_ct);
+    const uintptr_t variant_buf_word_ct = 2 * founder_ctaw;
+    ctx.variant_buf_word_ct = variant_buf_word_ct;
+    const uintptr_t per_slot_byte_ct = variant_buf_word_ct * sizeof(intptr_t) + sizeof(VariantAggs);
+    // The ring has to hold the widest window plus a whole block of index
+    // variants, since a block's leftmost and rightmost windows don't overlap.
+    uintptr_t avail = bigstack_left();
+    avail -= MINV(avail / 8, 1024 * 1024);
+    if (unlikely(avail / per_slot_byte_ct < S_CAST(uintptr_t, max_window_ct) + 1)) {
+      goto LdScore_ret_NOMEM;
+    }
+    uint32_t block_size = 1;
+    {
+      const uintptr_t slot_cap = avail / per_slot_byte_ct;
+      uintptr_t block_cap = slot_cap - max_window_ct;
+      if (block_cap > 65536) {
+        block_cap = 65536;
+      }
+      block_size = block_cap;
+    }
+    const uint32_t ring_size = max_window_ct + block_size;
+    ctx.ring_size = ring_size;
+    uintptr_t* genobufs;
+    VariantAggs* vaggs;
+    if (unlikely(bigstack_alloc_w(S_CAST(uintptr_t, ring_size) * variant_buf_word_ct, &genobufs) ||
+                 BIGSTACK_ALLOC_X(VariantAggs, ring_size, &vaggs))) {
+      goto LdScore_ret_NOMEM;
+    }
+    ctx.genobufs = genobufs;
+    ctx.vaggs = vaggs;
+
+    uint32_t calc_thread_ct = MINV(max_thread_ct, block_size);
+    if (unlikely(SetThreadCt(calc_thread_ct, &tg))) {
+      goto LdScore_ret_NOMEM;
+    }
+    uint32_t* thread_cidx_starts;
+    if (unlikely(bigstack_alloc_u32(calc_thread_ct + 1, &thread_cidx_starts))) {
+      goto LdScore_ret_NOMEM;
+    }
+    ctx.thread_cidx_starts = thread_cidx_starts;
+    SetThreadFuncAndData(LdScoreThread, &ctx, &tg);
+
+    const uint32_t output_zst = (flags / kfLdScoreZs) & 1;
+    const uint32_t max_chr_blen = GetMaxChrSlen(cip) + 1;
+    char* chr_buf;
+    if (unlikely(bigstack_alloc_c(max_chr_blen, &chr_buf))) {
+      goto LdScore_ret_NOMEM;
+    }
+    OutnameZstSet(".ldscore", output_zst, outname_end);
+    reterr = InitCstreamAlloc(outname, 0, output_zst, 1, kCompressStreamBlock + max_chr_blen + kMaxIdSlen + 256, &css, &cswritep);
+    if (unlikely(reterr)) {
+      goto LdScore_ret_1;
+    }
+    const uint32_t col_chrom = (flags / kfLdScoreColChrom) & 1;
+    const uint32_t col_pos = (flags / kfLdScoreColPos) & 1;
+    const uint32_t col_nobsi = (flags / kfLdScoreColNobsi) & 1;
+    const uint32_t col_l2 = (flags / kfLdScoreColL2) & 1;
+    *cswritep++ = '#';
+    if (col_chrom) {
+      cswritep = strcpya_k(cswritep, "CHROM\t");
+    }
+    if (col_pos) {
+      cswritep = strcpya_k(cswritep, "POS\t");
+    }
+    cswritep = strcpya_k(cswritep, "ID");
+    if (col_nobsi) {
+      cswritep = strcpya_k(cswritep, "\tNOBSI");
+    }
+    if (col_l2) {
+      cswritep = strcpya_k(cswritep, "\tL2");
+    }
+    AppendBinaryEoln(&cswritep);
+
+    fputs("--ld-score: 0%", stdout);
+    fflush(stdout);
+    uint32_t undefined_ct = 0;
+    uint32_t written_ct = 0;
+    uint32_t next_print_ct = kept_variant_ct / 100;
+    uintptr_t variant_uidx_base = 0;
+    uintptr_t cur_bits = variant_include[0];
+    for (uint32_t chr_fo_idx = 0; chr_fo_idx != chr_ct; ++chr_fo_idx) {
+      const uint32_t chr_vidx_start = cip->chr_fo_vidx_start[chr_fo_idx];
+      const uint32_t chr_vidx_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+      const uint32_t chr_variant_ct = PopcountBitRange(variant_include, chr_vidx_start, chr_vidx_end);
+      if (!chr_variant_ct) {
+        continue;
+      }
+      for (uint32_t cidx = 0; cidx != chr_variant_ct; ++cidx) {
+        chr_variant_uidxs[cidx] = BitIter1(variant_include, &variant_uidx_base, &cur_bits);
+      }
+      ctx.chr_variant_ct = chr_variant_ct;
+      const uint32_t chr_idx = cip->chr_file_order[chr_fo_idx];
+      char* chr_name_end = chrtoa(cip, chr_idx, chr_buf);
+      const uint32_t chr_name_slen = chr_name_end - chr_buf;
+
+      uint32_t loaded_end = 0;
+      for (uint32_t block_start = 0; block_start != chr_variant_ct; ) {
+        const uint32_t block_end = MINV(block_start + block_size, chr_variant_ct);
+        // Everything the block's widest window can reach has to be resident
+        // before the workers start.
+        const uint32_t need_start = LdScoreWindowStart(&ctx, block_start);
+        const uint32_t need_end = LdScoreWindowEnd(&ctx, block_end - 1);
+        if (loaded_end < need_start) {
+          loaded_end = need_start;
+        }
+        for (; loaded_end != need_end; ++loaded_end) {
+          const uint32_t slot_idx = loaded_end % ring_size;
+          uintptr_t* cur_genobuf = &(genobufs[slot_idx * variant_buf_word_ct]);
+          const uint32_t load_variant_uidx = chr_variant_uidxs[loaded_end];
+          reterr = PgrGetInv1(founder_info, pssi, founder_ct, load_variant_uidx, maj_alleles[load_variant_uidx], simple_pgrp, genovec);
+          if (unlikely(reterr)) {
+            PgenErrPrintNV(reterr, chr_variant_uidxs[loaded_end]);
+            goto LdScore_ret_1;
+          }
+          ZeroTrailingNyps(founder_ct, genovec);
+          SplitHomRef2het(genovec, founder_ct, cur_genobuf, &(cur_genobuf[founder_ctaw]));
+          uint32_t nm_ct;
+          uint32_t plusone_ct;
+          uint32_t minusone_ct;
+          FillVaggs(cur_genobuf, &(cur_genobuf[founder_ctaw]), BitCtToWordCt(founder_ct), &(vaggs[slot_idx]), &nm_ct, &plusone_ct, &minusone_ct);
+        }
+        const uint32_t cur_block_size = block_end - block_start;
+        const uint32_t cur_thread_ct = MINV(calc_thread_ct, cur_block_size);
+        for (uint32_t tidx = 0; tidx <= calc_thread_ct; ++tidx) {
+          const uint32_t capped_tidx = MINV(tidx, cur_thread_ct);
+          thread_cidx_starts[tidx] = block_start + ((S_CAST(uint64_t, capped_tidx) * cur_block_size) / cur_thread_ct);
+        }
+        ctx.block_start = block_start;
+        ctx.block_end = block_end;
+        if (cur_thread_ct == 1) {
+          LdScoreRange(&ctx, block_start, block_end);
+        } else {
+          DeclareLastThreadBlock(&tg);
+          if (unlikely(SpawnThreads(&tg))) {
+            goto LdScore_ret_THREAD_CREATE_FAIL;
+          }
+          JoinThreads(&tg);
+          ReinitThreads(&tg);
+        }
+
+        for (uint32_t cidx = block_start; cidx != block_end; ++cidx) {
+          const uint32_t variant_uidx = chr_variant_uidxs[cidx];
+          if (col_chrom) {
+            cswritep = memcpyax(cswritep, chr_buf, chr_name_slen, '\t');
+          }
+          if (col_pos) {
+            cswritep = u32toa_x(variant_bps[variant_uidx], '\t', cswritep);
+          }
+          cswritep = strcpya(cswritep, variant_ids[variant_uidx]);
+          if (col_nobsi) {
+            *cswritep++ = '\t';
+            cswritep = u32toa(nobs_results[cidx], cswritep);
+          }
+          const uint32_t is_undefined = (l2_results[cidx] < 0.0);
+          if (col_l2) {
+            *cswritep++ = '\t';
+            if (is_undefined) {
+              cswritep = strcpya_k(cswritep, "NA");
+            } else {
+              cswritep = dtoa_g(l2_results[cidx], cswritep);
+            }
+          }
+          undefined_ct += is_undefined;
+          AppendBinaryEoln(&cswritep);
+          if (unlikely(Cswrite(&css, &cswritep))) {
+            goto LdScore_ret_WRITE_FAIL;
+          }
+        }
+        written_ct += cur_block_size;
+        if (written_ct >= next_print_ct) {
+          if (written_ct != kept_variant_ct) {
+            printf("\b\b%u%%", (written_ct * 100LLU) / kept_variant_ct);
+            fflush(stdout);
+          }
+          next_print_ct = (written_ct / (kept_variant_ct / 100 + 1) + 1) * (kept_variant_ct / 100 + 1);
+        }
+        block_start = block_end;
+      }
+    }
+    if (unlikely(CswriteCloseNull(&css, cswritep))) {
+      goto LdScore_ret_WRITE_FAIL;
+    }
+    fputs("\b\b\b", stdout);
+    logprintfww("--ld-score: LD Scores for %u variant%s written to %s .\n", kept_variant_ct, (kept_variant_ct == 1)? "" : "s", outname);
+    if (multiallelic_skip_ct || haploid_skip_ct) {
+      logprintf("(%u multiallelic and %u haploid-chromosome variant%s skipped.)\n", multiallelic_skip_ct, haploid_skip_ct, (multiallelic_skip_ct + haploid_skip_ct == 1)? "" : "s");
+    }
+    if (undefined_ct) {
+      logprintf("(%u monomorphic variant%s reported as NA.)\n", undefined_ct, (undefined_ct == 1)? "" : "s");
+    }
+  }
+  while (0) {
+  LdScore_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  LdScore_ret_WRITE_FAIL:
+    reterr = kPglRetWriteFail;
+    break;
+  LdScore_ret_INCONSISTENT_INPUT:
+    reterr = kPglRetInconsistentInput;
+    break;
+  LdScore_ret_THREAD_CREATE_FAIL:
+    reterr = kPglRetThreadCreateFail;
+    break;
+  }
+ LdScore_ret_1:
+  CleanupThreads(&tg);
+  CswriteCloseCond(&css, cswritep);
+  BigstackReset(bigstack_mark);
+  return reterr;
+}
+
 typedef struct VariantHapAggsStruct {
   uint32_t nm_ct;
   uint32_t sum;

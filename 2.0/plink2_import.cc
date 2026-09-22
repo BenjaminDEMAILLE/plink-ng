@@ -5296,8 +5296,13 @@ BoolErr ParseBcfBiallelicHds(const unsigned char* dosage_main, const unsigned ch
       // if hds_valid and (cur_dphase_delta == 0), caller should override
       // hardcall-phase
       *hds_valid_ptr = 1;
-      int32_t second_bits;
-      CopyFromUnalignedOffsetI32(&second_bits, cur_hds_start, 1);
+      // A one-value HDS vector (every sample haploid, as htslib writes it)
+      // has no second slot to check; the next four bytes belong to the next
+      // sample.
+      int32_t second_bits = 0x7f800002;
+      if (hds_value_ct > 1) {
+        CopyFromUnalignedOffsetI32(&second_bits, cur_hds_start, 1);
+      }
       if (second_bits > 0x7f800000) {
         // haploid ok, half-call not ok
         // 0x7f800002 == END_OF_VECTOR

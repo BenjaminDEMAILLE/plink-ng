@@ -43,3 +43,13 @@ $1/plink2 $2 $3 --pfile tmp_data8 --export bcf vcf-dosage=HDS-force --out tmp_da
 $1/plink2 $2 $3 --bcf tmp_data8.bcf dosage=HDS --out tmp_data10
 # VCF-import and BCF-import are both smart about inferrable HDS.
 diff -q tmp_data9.pgen tmp_data10.pgen
+
+# When every sample in a variant is haploid, the BCF HDS vector has one value
+# per sample.  BCF import must not take the next sample's value as a second
+# haplotype dosage.
+printf '##fileformat=VCFv4.3\n##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n##FORMAT=<ID=HDS,Number=.,Type=Float,Description="Haplotype dosages">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\ts3\ts4\n' > tmp_hap.vcf
+printf 'MT\t100\tv1\tA\tG\t.\t.\t.\tGT:HDS\t1:1\t0:0\t1:0.8\t0:0.1\nMT\t200\tv2\tC\tT\t.\t.\t.\tGT:HDS\t0:0.2\t1:1\t0:0\t1:0.9\n' >> tmp_hap.vcf
+$1/plink2 $2 $3 --vcf tmp_hap.vcf dosage=HDS --out tmp_hap
+$1/plink2 $2 $3 --pfile tmp_hap --export bcf vcf-dosage=HDS-force --out tmp_hap
+$1/plink2 $2 $3 --bcf tmp_hap.bcf dosage=HDS --out tmp_hap2
+diff -q tmp_hap.pgen tmp_hap2.pgen

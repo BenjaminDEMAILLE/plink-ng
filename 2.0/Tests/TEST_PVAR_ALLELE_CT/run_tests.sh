@@ -3,6 +3,10 @@
 # A .pvar that understates a multiallelic variant's allele count must be
 # rejected, not decoded with the wrong allele-code width.
 #
+# (Exception: we can tolerate this when the .pvar entry is biallelic, and phase
+# information is never requested from the .pgen .  See later comments on PR
+# #539.)
+#
 # plink2 never stores allele counts in the .pgen header, so the .pvar is their
 # only source.  A record written with 5 alleles but read with 3 has its
 # allele codes read at the wrong width; before this change --freq,
@@ -42,18 +46,20 @@ VCF
     printf 's1\ns2\ns4\ns6\n' > tmp_keep.txt
     # The same records, with v1 declared as having 3 alleles.
     awk 'BEGIN { FS = OFS = "\t" } $3 == "v1" { $5 = "C,G" } { print }' tmp_$p.pvar > tmp_${p}3.pvar
-    # --freq and --geno-counts don't need the phase track, but skip it for
-    # phased multiallelic records so that the same check applies.
-    for c in "--make-pgen" "--export vcf" "--freq" "--geno-counts" "--keep tmp_keep.txt --freq" "--keep tmp_keep.txt --geno-counts"; do
-        expect_fail "Failed to unpack" $1 $2 $3 --pgen tmp_$p.pgen --pvar tmp_${p}3.pvar --psam tmp_$p.psam $c --out plink2_${p}3
-    done
+    if [ "$sep" = "/"]; then
+        for c in "--make-pgen" "--export vcf" "--freq" "--geno-counts" "--keep tmp_keep.txt --freq" "--keep tmp_keep.txt --geno-counts"; do
+            expect_fail ".pvar entry for (0-based) variant" $1 $2 $3 --pgen tmp_$p.pgen --pvar tmp_${p}3.pvar --psam tmp_$p.psam $c --out plink2_${p}3
+        done
+    else
+        # Check is opportunistic, not exhaustive.  --geno-counts does not try
+        # to scan to the end of the multiallelic .pgen record, so it doesn't
+        # trigger the error.
+        for c in "--make-pgen" "--export vcf" "--freq" "--keep tmp_keep.txt --freq"; do
+            expect_fail ".pvar entry for (0-based) variant" $1 $2 $3 --pgen tmp_$p.pgen --pvar tmp_${p}3.pvar --psam tmp_$p.psam $c --out plink2_${p}3
+        done
+    fi
 done
 
-# Second filesets: v1 declared biallelic.
-awk 'BEGIN { FS = OFS = "\t" } $3 == "v1" { $5 = "C" } { print }' tmp_u.pvar > tmp_ubi.pvar
-cp tmp_u.pgen tmp_ubi.pgen
-cp tmp_u.psam tmp_ubi.psam
-expect_fail "Variant #1 in the --pgen-diff fileset" $1 $2 $3 --pfile tmp_u --pgen-diff tmp_ubi --out plink2_diff
 # --flip-scan-ref-pfile gets the same check.  It is still gated as under
 # development, so this only runs once the gate is lifted.  (--flip-scan wants
 # at least 50 samples.)
@@ -86,11 +92,11 @@ cat > tmp_dup.vcf <<VCF
 ##contig=<ID=1,length=1000>
 ##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
 #CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	s1	s2	s3	s4	s5	s6
-1	10	v1	A	C,G	.	.	.	GT	0/2	0/1	./.	./.	0/0	1/2
+1	10	v1	A	C,G,T,AC	.	.	.	GT	0/2	0/4	./.	./.	0/0	1/2
 1	10	v1	A	C	.	.	.	GT	./.	./.	0/1	1/1	0/0	./.
 VCF
 $1/plink2 $2 $3 --vcf tmp_dup.vcf --make-pgen --out tmp_dup
-awk 'BEGIN { FS = OFS = "\t" } $3 == "v1" { $5 = "C" } { print }' tmp_dup.pvar > tmp_dupbi.pvar
+awk 'BEGIN { FS = OFS = "\t" } $3 == "v1" { $5 = "C,G" } { print }' tmp_dup.pvar > tmp_duptri.pvar
 cat > tmp_other.vcf <<VCF
 ##fileformat=VCFv4.3
 ##contig=<ID=2,length=1000>
@@ -101,4 +107,4 @@ VCF
 $1/plink2 $2 $3 --vcf tmp_other.vcf --make-pgen --out tmp_other
 # Sanity check: with the correct .pvar this merge runs.
 $1/plink2 $2 $3 --pfile tmp_other --pmerge tmp_dup --merge-mode nm-match --make-pgen --out plink2_merge_ok
-expect_fail "Variant #1 in a --pmerge\[-list\] fileset" $1 $2 $3 --pfile tmp_other --pmerge tmp_dup.pgen tmp_dupbi.pvar tmp_dup.psam --merge-mode nm-match --make-pgen --out plink2_merge_bad
+expect_fail ".pvar entry for (0-based) variant" $1 $2 $3 --pfile tmp_other --pmerge tmp_dup.pgen tmp_duptri.pvar tmp_dup.psam --merge-mode nm-match --make-pgen --out plink2_merge_bad

@@ -66,12 +66,7 @@ for p in swap bi; do
         echo "expected --make-pgen to reject tmp_ma_$p.pvar"
         exit 1
     fi
-    if [ "$p" = bi ]; then
-        # already caught by the global check
-        grep -q "contains multiallelic variants, while .pvar does not" tmp_err.txt
-    else
-        grep -q "Variant #1 has multiallelic hardcalls in the .pgen file, but only two" tmp_err.txt
-    fi
+    grep -q ".pvar entry for (0-based) variant #0 has too few alleles to be" tmp_err.txt
 done
 
 # Storage modes 12 and 14 (twelfth header byte) are single-sample encodings.

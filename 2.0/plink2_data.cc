@@ -6889,7 +6889,6 @@ THREAD_FUNC_DECL MakePgenThread(void* raw_arg) {
       uintptr_t* read_patch_10_set = nullptr;
       AlleleCode* read_patch_10_vals = nullptr;
       if (is_mhc) {
-        assert(read_allele_ct > 2);
         read_rare01_ct = cur_vrec_end[0];
         read_rare10_ct = cur_vrec_end[1];
         cur_vrec_end = &(cur_vrec_end[RoundUpPow2(2, kWordsPerVec)]);

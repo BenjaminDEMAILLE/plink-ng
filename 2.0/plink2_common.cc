@@ -4355,24 +4355,6 @@ char* PrintMultiallelicHcAsHaploidDs(uint32_t hc1, uint32_t hc2, uint32_t allele
 
 const char g_vft_names[3][18] = {"extract", "extract-intersect", "exclude"};
 
-uint32_t FindMultiallelicHcVsBiallelicPvar(const PgenFileInfo* pgfip, PgenHeaderCtrl header_ctrl, uint32_t raw_variant_ct) {
-  const unsigned char* vrtypes = pgfip->vrtypes;
-  if ((!vrtypes) || (header_ctrl & 0x30)) {
-    // no multiallelic hardcalls possible, or PgfiInitPhase2() already
-    // compared the allele counts
-    return UINT32_MAX;
-  }
-  const uintptr_t* allele_idx_offsets = pgfip->allele_idx_offsets;
-  for (uint32_t variant_uidx = 0; variant_uidx != raw_variant_ct; ++variant_uidx) {
-    if (vrtypes[variant_uidx] & 8) {
-      if ((!allele_idx_offsets) || (allele_idx_offsets[variant_uidx + 1] - allele_idx_offsets[variant_uidx] == 2)) {
-        return variant_uidx;
-      }
-    }
-  }
-  return UINT32_MAX;
-}
-
 void PgenErrPrintEx(const char* file_descrip, uint32_t prepend_lf, PglErr reterr, uint32_t variant_uidx) {
   if (reterr == kPglRetReadFail) {
     if (prepend_lf) {
@@ -4389,6 +4371,15 @@ void PgenErrPrintEx(const char* file_descrip, uint32_t prepend_lf, PglErr reterr
       logerrprintfww("Error: Failed to unpack (0-based) variant #%u in %s.\n", variant_uidx, file_descrip);
     }
     logerrputs("You can use --validate to check whether it is malformed.\n* If it is malformed, you probably need to either re-download the file, or\n  address an error in the command that generated the input .pgen.\n* If it appears to be valid, you have probably encountered a plink2 bug.  If\n  you report the error on GitHub or the plink2-users Google group (make sure to\n  include the full .log file in your report), we'll try to address it.\n");
+  } else if (reterr == kPglRetInconsistentInput) {
+    if (prepend_lf) {
+      logputs("\n");
+    }
+    if (variant_uidx == UINT32_MAX) {
+      logerrprintfww("Error: .pvar entry has too few alleles to be consistent with corresponding record in %s .\n", file_descrip);
+    } else {
+      logerrprintfww("Error: .pvar entry for (0-based) variant #%u has too few alleles to be consistent with corresponding record in %s .\n", variant_uidx, file_descrip);
+    }
   }
 }
 

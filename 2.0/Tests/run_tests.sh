@@ -218,6 +218,11 @@ cd TEST_GLM_MISSING
 cd ..
 echo "TEST_GLM_MISSING passed."
 
+cd TEST_KING_TABLE_MALFORMED
+./run_tests.sh $d $2 $3 > TEST_KING_TABLE_MALFORMED.log
+cd ..
+echo "TEST_KING_TABLE_MALFORMED passed."
+
 cd TEST_VCF_MALFORMED
 ./run_tests.sh $d $2 $3 > TEST_VCF_MALFORMED.log
 cd ..

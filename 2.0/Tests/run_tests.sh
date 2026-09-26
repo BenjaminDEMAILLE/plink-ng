@@ -218,6 +218,11 @@ cd TEST_GLM_MISSING
 cd ..
 echo "TEST_GLM_MISSING passed."
 
+cd TEST_PGEN_EMPTY_DOSAGE_LIST
+./run_tests.sh $d $2 $3 > TEST_PGEN_EMPTY_DOSAGE_LIST.log
+cd ..
+echo "TEST_PGEN_EMPTY_DOSAGE_LIST passed."
+
 cd TEST_OXFORD_SAMPLE
 ./run_tests.sh $d $2 $3 > TEST_OXFORD_SAMPLE.log
 cd ..

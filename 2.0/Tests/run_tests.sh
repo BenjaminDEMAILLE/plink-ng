@@ -218,6 +218,11 @@ cd TEST_GLM_MISSING
 cd ..
 echo "TEST_GLM_MISSING passed."
 
+cd TEST_BGEN_MALFORMED
+./run_tests.sh $d $2 $3 > TEST_BGEN_MALFORMED.log
+cd ..
+echo "TEST_BGEN_MALFORMED passed."
+
 cd TEST_PVAR_ALLELE_CT
 ./run_tests.sh $d $2 $3 > TEST_PVAR_ALLELE_CT.log
 cd ..

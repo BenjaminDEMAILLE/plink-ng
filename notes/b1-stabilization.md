@@ -97,3 +97,40 @@ Questions:
 7. Manhattan-distance hardcall consistency rule ("TBD", spec:588): required? --hard-call-threshold?
 8. In-memory layout must match on-disk sample-major order? 255 cap kept?
 9. Import: VCF DS Number=A directly? Per-allele HDS? GP ignored for multiallelic?
+
+## State at end of 2026-09-30 (cloud session, second pass)
+
+Point 1 done for this round: 3 agents (oracle vs 1.9, structural sweep, parser fuzzing)
+plus manual checks found ~25 bugs; all verified by hand, fixed, with regression tests.
+Full suite 72/72 normal + 72/72 ASan/UBSan (Linux x86-64, gcc, OpenBLAS).
+
+8 branches pushed to the fork, each based on upstream master 17a8368, each built and
+tested standalone, and merging cleanly together (simulated):
+- fix-2-epistasis-blocks-alignment  (--blocks/--epistasis crashes at 400/448/800 samples;
+  .epi.qt empty column; log10 no-op; ref-based rejected)
+- fix-2-adjust-sidak-zero-p        (Sidak = 0 for p in ~1e-16..1e-27; abort on p = 0)
+- fix-19-adjust-sidak-expm1        (same Sidak bug in 1.9)
+- fix-2-test-mishap-labels         (all haplotype labels named the wrong allele)
+- fix-2-strbox-dedup               (CopyAndDedupSortedStrptrsToStrbox never deduped;
+  --make-set duplicate sets)
+- fix-2-distance-nonautosomes      (chrX/Y/MT counted diploid; --parallel square)
+- fix-2-malformed-inputs           (9 fuzz crashes, printf types, --adjust-file p>1 and
+  long-allele buffer overflow, --meta-analysis buffer, --ld-score-annot parsing)
+- fix-2-grm-maf-threshold          (error message and help formula)
+
+Upstream PRs: this cloud session cannot reach chrchang/plink-ng through the GitHub App
+(only the fork is installed), so the PRs are opened by the user from prefilled
+compare links (title + body = commit messages).  Next: check that the 8 PRs exist,
+follow their CI (sdist macos test_multithread is a known timing flake, pgenlib only).
+
+Not fixed, for Chang to decide:
+- --meta-analysis counts a within-file duplicate ID as extra studies (1.9 keeps first).
+- --twolocus ignores ploidy (chrY females, haploid hets).
+- --epistasis-boost STAT can print -3e-15; BEST_CHISQ likewise.
+- --glm linear/logistic write "nan" A1_FREQ/MACH_R2 for all-missing variants
+  (multinomial writes NA).
+- --flip-scan chrX males coded 0/2 vs 1.9's 0/1 (undocumented difference).
+- 1.9: --fast-epistasis boost prints P=0 for tiny negative STAT; --set-table with 0 sets
+  writes no newlines.
+Idea to propose: __attribute__((format(printf,1,2))) on log*printf* helpers would have
+caught 12 format bugs at compile time.

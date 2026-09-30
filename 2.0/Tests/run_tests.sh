@@ -293,6 +293,11 @@ cd TEST_ADJUST_EXTREME_P
 cd ..
 echo "TEST_ADJUST_EXTREME_P passed."
 
+cd TEST_MALFORMED_INPUTS
+./run_tests.sh $d $2 $3 > TEST_MALFORMED_INPUTS.log
+cd ..
+echo "TEST_MALFORMED_INPUTS passed."
+
 cd TEST_SCORE_VS_FIXED_ALLELE
 ./run_tests.sh $d $2 $3 > TEST_SCORE_VS_FIXED_ALLELE.log
 cd ..

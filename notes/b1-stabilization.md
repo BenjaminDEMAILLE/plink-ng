@@ -2,7 +2,11 @@
 
 Goal: help Chang reach `v2.0.0-b.1.0`. Per #338 (his 2026-09-21 comment), master is
 `v2.0.0-b.1-dev`, multipass merge landed (#493), and he tags b.1.0 once the first wave
-of bug reports settles. Multiallelic dosage may stay mostly absent in b.1.
+of bug reports settles.
+
+Scope update from Chang on #344 (2026-10-01): variant-join (`--make-pgen multiallelics=+`
+and friends) is the other significant feature worth including in b.1.0. Beta 2 will
+mostly be about multiallelic dosage support, so point 5 is beta-2 work, not b.1.
 
 Plan (user approved all five points):
 1. Provoke the bug wave ourselves: differential oracles vs 1.9, sanitizers, fuzzing on
@@ -10,7 +14,8 @@ Plan (user approved all five points):
 2. Clear our own PR backlog ("in or out for b.1?").
 3. Interface stabilization: short list of proposals to Chang.
 4. User-visible "under development" errors, ranked by impact.
-5. Multiallelic dosage: ask Chang for the on-disk design before any code.
+5. Multiallelic dosage: ask Chang for the on-disk design before any code. Deferred to
+   beta 2 (Chang, #344, 2026-10-01); variant-join takes its place for b.1.0.
 
 ## State at end of 2026-09-30
 
@@ -74,10 +79,11 @@ From the review agent, not yet re-verified:
 7. `--flip-scan-ref-{p,b}file` (plink2.cc:7812): backend exists (plink2_ld.cc:16996),
    remaining work is founder filtering + multiallelic check. Easiest win.
 8. multiallelic join `multiallelics=+` (plink2_data.cc:7505, 8542). Large.
+   Chang wants this in b.1.0 (#344, 2026-10-01): top priority of this list for b.1.
 9. BGEN multiallelic export/import (plink2_export.cc:3162, plink2_import.cc:14237).
 10. `--merge-sids` (plink2_merge.cc:358). 11. `--pgen-diff` MD. 12. `--homozyg` 1.9 extras.
 
-## Point 5: multiallelic dosage, questions for Chang
+## Point 5: multiallelic dosage, questions for Chang (beta 2, not b.1)
 
 Defined today: track 4 = uint16 sum of ALT dosages; tracks 5-6 = delta-encoded
 <sample x rarealt> list + 16-bit values, max 255 entries per sample

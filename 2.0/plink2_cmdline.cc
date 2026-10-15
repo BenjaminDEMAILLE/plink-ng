@@ -1,5 +1,5 @@
 // This library is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This library is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by the
@@ -2424,7 +2424,15 @@ uint32_t CubicRealRoots(double coef_a, double coef_b, double coef_c, STD_ARRAY_R
   }
   // 0 <= small_r2 < small_q3_x4; no risk of qq < 0 or sqrt_q * qq == 0.
   const double sqrt_q = sqrt(qq);
-  const double ratio = rr / (sqrt_q * qq);
+  double ratio = rr / (sqrt_q * qq);
+  // bugfix (10 Oct 2026): when small_r2 is only barely below small_q3_x4,
+  // rounding error can push |ratio| a ulp or so past 1, and acos() would then
+  // return NaN.
+  if (ratio > 1.0) {
+    ratio = 1.0;
+  } else if (ratio < -1.0) {
+    ratio = -1.0;
+  }
   const double theta_div3 = acos(ratio) * (1.0 / 3.0);
   const double norm = -2 * sqrt_q;
   double sol0 = prefer_fma(norm, cos(theta_div3), -coef_a_div3);
@@ -2741,11 +2749,16 @@ PglErr CmdlineAllocString(const char* source, const char* flag_name, uint32_t ma
     logerrprintf("Error: %s argument too long.\n", flag_name);
     return kPglRetInvalidCmdline;
   }
-  const uint32_t blen = slen + 1;
-  if (unlikely(pgl_malloc(blen, sbuf_ptr))) {
+  // Pad with kBytesPerVec-1 extra zero bytes: consumers may scan the string
+  // with Strchrnul()/strnul(), whose vectorized implementations read a whole
+  // aligned vector at a time and so touch up to kBytesPerVec-1 bytes past the
+  // terminator.  Those loads cannot fault, since an aligned vector never
+  // straddles a page boundary, but AddressSanitizer flags them.
+  if (unlikely(pgl_malloc(slen + kBytesPerVec, sbuf_ptr))) {
     return kPglRetNomem;
   }
-  memcpy(*sbuf_ptr, source, blen);
+  memcpy(*sbuf_ptr, source, slen);
+  memset(&((*sbuf_ptr)[slen]), 0, kBytesPerVec);
   return kPglRetSuccess;
 }
 
@@ -2829,14 +2842,24 @@ PglErr AllocAndFlattenEx(const char* const* sources, const char* flagname_p, uin
     tot_blen += cur_blen;
   }
   char* buf_iter;
-  if (pgl_malloc(tot_blen, &buf_iter)) {
+  // Consumers walk this list with strnul(), whose vectorized Rawmemchr() reads
+  // a whole aligned vector at a time and so touches up to kBytesPerVec-1 bytes
+  // past the final terminator.  Those loads cannot fault, since an aligned
+  // vector never straddles a page boundary, but AddressSanitizer flags them:
+  // this is one of only two exact-size malloc() buffers scanned that way, the
+  // rest being bigstack.  kBytesPerVec-1 bytes of slack covers the overshoot
+  // whatever alignment malloc() happens to give us, which rounding the request
+  // up to a vector multiple does not: that only works when the base is already
+  // vector-aligned.
+  const uintptr_t alloc_blen = tot_blen + kBytesPerVec - 1;
+  if (pgl_malloc(alloc_blen, &buf_iter)) {
     return kPglRetNomem;
   }
   *flattened_buf_ptr = buf_iter;
   for (uint32_t param_idx = 0; param_idx != param_ct; ++param_idx) {
     buf_iter = strcpyax(buf_iter, sources[param_idx], '\0');
   }
-  *buf_iter = '\0';
+  memset(buf_iter, 0, kBytesPerVec);
   return kPglRetSuccess;
 }
 
@@ -3247,7 +3270,10 @@ PglErr CmdlineParsePhase1(const char* ver_str, const char* ver_str2, const char*
           reterr = kPglRetHelp;
           goto CmdlineParsePhase1_ret_1;
         }
-        if (strequal_k(flagname_p, "version", flagname_p_slen)) {
+        // -v/-V as well as --version, mirroring the -h/-? handling above.
+        if (strequal_k(flagname_p, "version", flagname_p_slen) ||
+            strequal_k(flagname_p, "v", flagname_p_slen) ||
+            strequal_k(flagname_p, "V", flagname_p_slen)) {
           version_present = 1;
         } else if (strequal_k(flagname_p, "silent", flagname_p_slen)) {
           silent_present = 1;
@@ -4267,7 +4293,7 @@ PglErr ValidateAndAllocCmpExpr(const char* const* sources, const char* flag_name
 
 // See e.g. meta_analysis_open_and_read_header() in plink 1.9.
 // Assumes at least one search term.
-PglErr SearchHeaderLine(const char* header_line_iter, const char* const* search_multistrs, const char* flagname_p, uint32_t search_col_ct, uint32_t* found_col_ct_ptr, uint32_t* found_type_bitset_ptr, uint32_t* col_skips, uint32_t* col_types) {
+PglErr SearchHeaderLine(const char* header_line_iter, const char* const* search_multistrs, const char* flag_nodash, uint32_t search_col_ct, uint32_t* found_col_ct_ptr, uint32_t* found_type_bitset_ptr, uint32_t* col_skips, uint32_t* col_types) {
   assert(search_col_ct <= 32);
   unsigned char* bigstack_mark = g_bigstack_base;
   PglErr reterr = kPglRetSuccess;
@@ -4306,7 +4332,7 @@ PglErr SearchHeaderLine(const char* header_line_iter, const char* const* search_
     assert(search_term_ct);
     const char* duplicate_search_term = FindSortedStrboxDuplicate(merged_strbox, search_term_ct, max_blen);
     if (unlikely(duplicate_search_term)) {
-      logerrprintfww("Error: Duplicate term '%s' in --%s column search order.\n", duplicate_search_term, flagname_p);
+      logerrprintfww("Error: Duplicate term '%s' in --%s column search order.\n", duplicate_search_term, flag_nodash);
       goto SearchHeaderLine_ret_INVALID_CMDLINE;
     }
 
@@ -4322,7 +4348,9 @@ PglErr SearchHeaderLine(const char* header_line_iter, const char* const* search_
         const uint32_t priority_idx = cur_map_idx >> 5;
         if (priority_vals[search_col_idx] >= priority_idx) {
           if (unlikely(priority_vals[search_col_idx] == priority_idx)) {
-            logerrprintfww("Error: Duplicate column header '%s' in --%s file.\n", &(merged_strbox[max_blen * cur_map_idx]), flagname_p);
+            // cur_map_idx packs the search-column index and the priority
+            // index; ii is the merged_strbox entry that was actually matched.
+            logerrprintfww("Error: Duplicate column header '%s' in --%s file.\n", &(merged_strbox[max_blen * S_CAST(uint32_t, ii)]), flag_nodash);
             goto SearchHeaderLine_ret_MALFORMED_INPUT;
           }
           priority_vals[search_col_idx] = priority_idx;

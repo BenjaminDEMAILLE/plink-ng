@@ -1201,6 +1201,10 @@ int32_t update_marker_alleles(char* update_alleles_fname, uint32_t* marker_id_ht
       goto update_marker_alleles_ret_INVALID_FORMAT_2;
     }
     SET_BIT(marker_uidx, already_seen);
+    if (!next_token_mult(bufptr3, 4)) {
+      LOGPREPRINTFWW("Error: Line %" PRIuPTR " of --update-alleles file has fewer tokens than expected.\n", line_idx);
+      goto update_marker_alleles_ret_INVALID_FORMAT_2;
+    }
     bufptr2 = skip_initial_spaces(bufptr2);
     len2 = strlen_se(bufptr2);
     bufptr = &(bufptr2[len2]);
@@ -2187,7 +2191,14 @@ int32_t read_external_freqs(char* freqname, uintptr_t unfiltered_marker_ct, uint
 	      snprintf(g_logbuf, LOGBUFLEN, "Error: Invalid hap. A2 count on line %" PRIuPTR " of --read-freq file.\n", line_idx);
 	      goto read_external_freqs_ret_INVALID_FORMAT_2;
 	    }
-	    cur_nchrobs = 2 * (c_hom_a1 + c_het + c_hom_a2 + maf_succ) + c_hap_a1 + c_hap_a2;
+	    // each count is at most 2^31 - 1, so the total can overflow 32 bits;
+	    // apply the same limit as the .frq NCHROBS column to it
+	    const uint64_t nchrobs_u64 = 2 * (((uint64_t)c_hom_a1) + c_het + c_hom_a2 + maf_succ) + c_hap_a1 + c_hap_a2;
+	    if (nchrobs_u64 > 0x7fffffff) {
+	      snprintf(g_logbuf, LOGBUFLEN, "Error: Too many allele observations on line %" PRIuPTR " of --read-freq file.\n", line_idx);
+	      goto read_external_freqs_ret_INVALID_FORMAT_2;
+	    }
+	    cur_nchrobs = nchrobs_u64;
 	    maf = ((double)(c_hom_a1 * 2 + c_het + c_hap_a1 + maf_succ)) / ((double)cur_nchrobs);
 	    if (nchrobs) {
 	      nchrobs[marker_uidx] = cur_nchrobs;
@@ -5314,6 +5325,7 @@ int32_t meta_analysis(char* input_fnames, char* chrfield_search_order, char* snp
   uintptr_t window_entry_base_cost = 2;
   uintptr_t duplicate_id_htable_max_alloc = 0;
   uint64_t rejected_ct = 0;
+  uint64_t p_underflow_ct = 0;
   double cur_p = 0.0;
   double cur_ess = 0.0;
   uint32_t max_var_id_len_p1 = 0;
@@ -5856,13 +5868,23 @@ int32_t meta_analysis(char* input_fnames, char* chrfield_search_order, char* snp
 	if (scan_double(token_ptrs[1], &cur_beta) || (cur_beta == INFINITY) || ((!input_beta) && (!(cur_beta >= 0))) || (input_beta && ((cur_beta != cur_beta) || (cur_beta == -INFINITY)))) {
 	  problem_mask |= 0x10;
 	}
-	if (scan_double(token_ptrs[2], &cur_se) || (!(cur_se >= 0.0)) || (cur_se == INFINITY)) {
+	// A zero standard error is as unusable as a negative one: the
+	// inverse-variance weight is 1 / (se * se), so it turns the whole
+	// variant's estimate into a NaN while still being counted in N.
+	if (scan_double(token_ptrs[2], &cur_se) || (!(cur_se > 0.0)) || (cur_se == INFINITY)) {
 	  problem_mask |= 0x20;
 	}
 	if (weighted_z) {
 	  if (scan_double(token_ptrs[3], &cur_p) || (!(cur_p >= 0.0)) || (cur_p > 1.0)) {
 	    problem_mask |= 0x80;
 	  }
+          // update (13 Sep 2026): SE=0 isn't really salvageable, but treating
+          // cur_p<DBL_MIN as cur_p=DBL_MIN should prevent the latter type of
+          // significant result from getting lost.
+          if (cur_p < 2.2250738585072014e-308) {
+            ++p_underflow_ct;
+            cur_p = 2.2250738585072014e-308;
+          }
 	  if (scan_double(token_ptrs[4], &cur_ess) || (!(cur_ess > 0.0)) || (cur_ess == INFINITY)) {
 	    problem_mask |= 0x100;
 	  }
@@ -6277,11 +6299,11 @@ int32_t meta_analysis(char* input_fnames, char* chrfield_search_order, char* snp
 	  if (!realnum(cur_beta)) {
 	    continue;
 	  }
-	  if (scan_double(token_ptrs[2], &cur_se) || (!(cur_se >= 0.0)) || (cur_se == INFINITY)) {
+	  if (scan_double(token_ptrs[2], &cur_se) || (!(cur_se > 0.0)) || (cur_se == INFINITY)) {
 	    continue;
 	  }
 	  if (weighted_z) {
-	    if (scan_double(token_ptrs[3], &cur_p) || (!(cur_p >= 0.0)) || (cur_p > 1.0)) {
+	    if (scan_double(token_ptrs[3], &cur_p) || (!(cur_p > 0.0)) || (cur_p > 1.0)) {
 	      continue;
 	    }
 	    if (scan_double(token_ptrs[4], &cur_ess) || (!(cur_ess > 0.0)) || (cur_ess == INFINITY)) {
@@ -6575,6 +6597,9 @@ int32_t meta_analysis(char* input_fnames, char* chrfield_search_order, char* snp
       putc_unlocked('\r', stdout);
     }
     LOGPRINTFWW("--meta-analysis: %" PRIuPTR " variant%s processed; results written to %s .\n", final_variant_ct, (final_variant_ct == 1)? "" : "s", outname);
+    if (p_underflow_ct) {
+      LOGERRPRINTF("Warning: %" PRIu64 " p-value%s underflowed, treated as 2.225e-308.\n", p_underflow_ct, (p_underflow_ct == 1)? "" : "s");
+    }
   }
 
   while (0) {

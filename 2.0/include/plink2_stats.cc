@@ -1,5 +1,5 @@
 // This library is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This library is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by the
@@ -29,9 +29,9 @@ namespace plink2 {
 
 // Thread-unsafe portions of plink_stats.c have been replaced, mostly by code
 // derived from boost/math/special_functions/gamma.hpp and
-// boost/math/special_functions/detail/igamma_inverse.hpp in Boost 1.60 and
-// 1.84 (Maddock et al.).  The derived portions are subject to the following
-// license:
+// boost/math/special_functions/detail/igamma_inverse.hpp in Boost 1.60, 1.84,
+// and 1.91 (Maddock et al.).  The derived portions are subject to the
+// following license:
 //
 // *****
 // Boost Software License - Version 1.0 - August 17th, 2003
@@ -664,8 +664,149 @@ double ChisqToLnP(double chisq, uint32_t df) {
 // ***** end ChisqToLnP *****
 
 
-// ***** thread-safe PToChisq *****
-// port of Boost 1.60 implementation
+// ***** thread-safe LnPToChisq *****
+// port of Boost 1.60-1.91 implementation
+
+double find_inverse_gamma_df1_shared(double yy) {
+  const double c1 = -0.5 * log(yy);
+  const double c1_2 = c1 * c1;
+  const double c1_3 = c1_2 * c1;
+  const double c1_4 = c1_2 * c1_2;
+  // a_2 = 0.25
+  // a_3 = 0.125
+
+  const double c2 = -0.5 * (1 + c1);
+  const double c3 = 0.25 * c1_2 + prefer_fma(0.75, c1, 0.875);
+  const double c4 = prefer_fma(c1_3, -1.0 / 6.0, -26.75 / 12.0) - prefer_fma(0.875, c1_2, 1.875 * c1);
+  const double c5 = prefer_fma(5.75 / 6.0, c1_3, 0.125 * c1_4) + prefer_fma(3.625, c1_2, prefer_fma(7.75, c1, 83.0625 / 12.0));
+
+  const double y_recip = 1.0 / yy;
+  return POLY4(y_recip, yy + c1, c2, c3, c4, c5);
+}
+
+double find_inverse_s_poly(double tt) {
+  return tt - POLY3(tt, 3.31125922108741, 11.6616720288968, 4.28342155967104, 0.213623493715853) / POLY4(tt, 1, 6.61053765625462, 6.40691597760039, 1.27364489782223, 0.3611708101884203e-1);
+}
+
+double find_inverse_s(double pp, double qq) {
+  double tt;
+  if (pp < 0.5) {
+    tt = sqrt(-2 * log(pp));
+  } else {
+    tt = sqrt(-2 * log(qq));
+  }
+  double ss = find_inverse_s_poly(tt);
+  if (pp < 0.5) {
+    ss = -ss;
+  }
+  return ss;
+}
+
+double didonato_sn_a2(double x, uint32_t nn) {
+  // a=2, nn>=1, tolerance=1e-4 hardcoded
+  const double tolerance = 1e-4;
+  double sum = 1;
+  double partial = x * (1 / 3);
+  sum += partial;
+  for (uint32_t i = 2; i <= nn; ++i) {
+    partial *= x / u31tod(2 + i);
+    sum += partial;
+    if (partial < tolerance) {
+      break;
+    }
+  }
+  return sum;
+}
+
+double find_inverse_gamma_df4_shared(double pp, double qq, double lnq, uint32_t* has_10_digits_ptr) {
+  // Two modes:
+  //   (pp, qq): ok to initialize lnq to 0
+  //   lnq only: set qq = -1; has_10_digits_ptr == nullptr ok
+  double s;
+  if (qq != -1) {
+    s = find_inverse_s(pp, qq);
+  } else {
+    const double tt = sqrt(-2 * lnq);
+    s = find_inverse_s_poly(tt);
+  }
+  const double s_2 = s * s;
+  const double s_3 = s_2 * s;
+  const double s_4 = s_2 * s_2;
+  const double s_5 = s_4 * s;
+  // const double ra = sqrt(a);
+  const double ra = kSqrt2;
+
+  // refer to Boost code if adapting to other dfs
+  double w = 2 + s * ra + (s * s - 1) * (1 / 3);
+  w += (s_3 - 7 * s) / (36 * ra);
+  w -= (3 * s_4 + 7 * s_2 - 16) * (1 / (810 * 2));
+  w += (9 * s_5 + 256 * s_3 - 433 * s) * (1 / (38880 * 2 * ra));
+
+  if (qq < 0.5) {
+    if (qq != -1) {
+      lnq = log(qq);
+    }
+    if (w < 6) {
+      return w;
+    }
+    // const double D = MAXV(2, a * (a - 1));  i.e. 2
+    // const double lg = lgamma(a);  i.e. 0
+    // const double lb = lnq + lg;
+    const double lb = lnq;
+    if (lb < -4.6) {
+      // DiDonato and Morris Eq 25
+      const double y = -lb;
+      const double c1 = log(y);
+      const double c1_2 = c1 * c1;
+      const double c1_3 = c1_2 * c1;
+      const double c1_4 = c1_2 * c1_2;
+
+      const double c2 = 1 + c1;
+      const double c3 = (-(c1_2 * 0.5) + 1 * 0.5);
+      const double c4 = ((c1_3 / 3) - c1_2 * 0.5 - c1 - 1 / 6);
+      const double c5 = (-(c1_4 * 0.25)
+                         + c1_3 * (5 / 6)
+                         + c1_2
+                         - c1 * 0.5
+                         - 5 / 12);
+
+      const double y_2 = y * y;
+      const double y_3 = y_2 * y;
+      const double y_4 = y_2 * y_2;
+      return y + c1 + (c2 / y) + (c3 / y_2) + (c4 / y_3) + (c5 / y_4);
+    }
+    // DiDonato and Morris Eq 33
+    const double u = -lb + log(w) - log(1 - 1 / (1 + w));
+    return -lb + log(u) - log(1 - 1 / (1 + u));
+  }
+  double z = w;
+  double v = 1;
+  if (w < 0.45) {
+    // DiDonato and Morris Eq 35
+    v = log(pp) + kLn2;
+    z = exp((v + w) * 0.5);
+    s = log1p(z * (1 / 3) * (1 + z * 0.25));
+    z = exp((v + z - s) * 0.5);
+    s = log1p(z * (1 / 3) * (1 + z * 0.25));
+    z = exp((v + z - s) * 0.5);
+    s = log1p(z * (1 / 3) * (1 + z * 0.25 * (1 + z * 0.2)));
+    z = exp((v + z - s) * 0.5);
+  }
+
+  if ((z <= 0.03) || (z > 2.1)) {
+    if (z <= 0.006) {
+      *has_10_digits_ptr = 1;
+    }
+    return z;
+  }
+  // DiDonato and Morris Eq 36
+  const double ls = log(didonato_sn_a2(z, 100));
+  if (v == 1) {
+    v = log(pp) + kLn2;
+  }
+  z = exp((v + z - ls) * 0.5);
+  return z * (1 - (2 * log(z) - z - v + ls) / (2 - z));
+}
 
 double find_inverse_gamma2(uint32_t df, double pp, double qq, uint32_t* has_10_digits_ptr) {
   // currently assumes *has_10_digits_ptr initialized to zero
@@ -683,41 +824,25 @@ double find_inverse_gamma2(uint32_t df, double pp, double qq, uint32_t* has_10_d
       //   = p * p * pi * 0.25
       const double uu = pp * pp * (0.25 * kPi);
       return uu / prefer_fma(uu, -1.0 / 1.5, 1);
-    } else {
-      const double yy = -log(bb);
-      if (bb > 0.1) {
-        const double uu = yy - 0.5 * log(yy);
-        if (bb > 0.15) {
-          return (yy - 0.5 * log(uu) - log(1 + 0.5 / uu));
-        }
-        return (yy - 0.5 * log(uu) - log(prefer_fma(uu + 5, uu, 3.75) / prefer_fma(uu + 4.5, uu, 2)));
-      } else {
-        const double c1 = -0.5 * log(yy);
-        const double c1_2 = c1 * c1;
-        const double c1_3 = c1_2 * c1;
-        const double c1_4 = c1_2 * c1_2;
-        // a_2 = 0.25
-        // a_3 = 0.125
-
-        const double c2 = -0.5 * (1 + c1);
-        const double c3 = 0.25 * c1_2 + prefer_fma(0.75, c1, 0.875);
-        const double c4 = prefer_fma(c1_3, -1.0 / 6.0, -26.75 / 12.0) - prefer_fma(0.875, c1_2, 1.875 * c1);
-        const double c5 = prefer_fma(5.75 / 6.0, c1_3, 0.125 * c1_4) + prefer_fma(3.625, c1_2, prefer_fma(7.75, c1, 83.0625 / 12.0));
-
-        if (bb < 1e-28) {
-          *has_10_digits_ptr = 1;
-        }
-        const double y_recip = 1.0 / yy;
-        // todo: test this substitute
-        // return POLY4(y_recip, yy + c1, c2, c3, c4, c5);
-        const double y_recip_2 = y_recip * y_recip;
-        const double y_recip_3 = y_recip_2 * y_recip;
-        const double y_recip_4 = y_recip_2 * y_recip_2;
-        return prefer_fma(c2, y_recip, yy) + prefer_fma(c3, y_recip_2, c1) + prefer_fma(c5, y_recip_4, c4 * y_recip_3);
-      }
     }
+    const double yy = -log(bb);
+    if (bb > 0.1) {
+      const double uu = yy - 0.5 * log(yy);
+      if (bb > 0.15) {
+        return (yy - 0.5 * log(uu) - log(1 + 0.5 / uu));
+      }
+      return (yy - 0.5 * log(uu) - log(prefer_fma(uu + 5, uu, 3.75) / prefer_fma(uu + 4.5, uu, 2)));
+    }
+    if (bb < 1e-28) {
+      *has_10_digits_ptr = 1;
+    }
+    return find_inverse_gamma_df1_shared(yy);
   }
-  // not implemented yet
+  if (df == 4) {
+    return find_inverse_gamma_df4_shared(pp, qq, 0, has_10_digits_ptr);
+  }
+  // not implemented yet (but not difficult to add, just need to make the df=4
+  // function messier)
   assert(0);
   exit(1);
   return 0;
@@ -846,41 +971,23 @@ double gamma_p_inv_imp2(uint32_t df, double qq) {
   return result;
 }
 
-// double PToChisq(double pval, uint32_t df) {
-//   // only need this to handle df=1, 2, 4 for now
-//   return gamma_p_inv_imp2(df, pval) * 2;
-// }
-
-// ***** end thread-safe PToChisq *****
-
-double LnPToChisq(double ln_pval) {
+double LnPToChisq(double ln_pval, uint32_t df) {
   if (ln_pval > -65.04474754675797) {
-    return gamma_p_inv_imp2(1, exp(ln_pval)) * 2;
+    return 2 * gamma_p_inv_imp2(df, exp(ln_pval));
   }
-  // (bb < 1e-28) case in find_inverse_gamma2()
-  // possible todo: deduplicate code
-  const double yy = kLnSqrtPi - ln_pval;
-  const double c1 = -0.5 * log(yy);
-  const double c1_2 = c1 * c1;
-  const double c1_3 = c1_2 * c1;
-  const double c1_4 = c1_2 * c1_2;
-  // a_2 = 0.25
-  // a_3 = 0.125
-
-  const double c2 = -0.5 * (1 + c1);
-  const double c3 = 0.25 * c1_2 + prefer_fma(0.75, c1, 0.875);
-  const double c4 = prefer_fma(c1_3, -1.0 / 6.0, -26.75 / 12.0) - prefer_fma(0.875, c1_2, 1.875 * c1);
-  const double c5 = prefer_fma(5.75 / 6.0, c1_3, 0.125 * c1_4) + prefer_fma(3.625, c1_2, prefer_fma(7.75, c1, 83.0625 / 12.0));
-
-  const double y_recip = 1.0 / yy;
-  // todo: test this substitute
-  // return POLY4(y_recip, yy + c1, c2, c3, c4, c5);
-  const double y_recip_2 = y_recip * y_recip;
-  const double y_recip_3 = y_recip_2 * y_recip;
-  const double y_recip_4 = y_recip_2 * y_recip_2;
-  return 2 * (prefer_fma(c2, y_recip, yy) + prefer_fma(c3, y_recip_2, c1) + prefer_fma(c5, y_recip_4, c4 * y_recip_3));
+  if (df == 1) {
+    // (bb < 1e-28) case in find_inverse_gamma2()
+    // bugfix (13 Sep 2026): kLnSqrtPi term had wrong sign
+    const double yy = -kLnSqrtPi - ln_pval;
+    return 2 * find_inverse_gamma_df1_shared(yy);
+  }
+  if (df == 2) {
+    return -2 * ln_pval;
+  }
+  return 2 * find_inverse_gamma_df4_shared(0, -1, ln_pval, nullptr);
 }
 
+// ***** end thread-safe LnPToChisq *****
 
 // ***** thread-safe TstatToLnP *****
 
@@ -1334,6 +1441,9 @@ double FstatToLnP(double ff, uint32_t df1, uint32_t df2) {
 
 // Inverse normal distribution
 // (todo: check if boost implementation is better)
+// (todo: benchmark against high-accuracy github.com/chrchang/stats
+// implementation, if the latter is not much slower we can just use it
+// everywhere)
 
 // Lower tail quantile for standard normal distribution function.
 //
@@ -1355,43 +1465,6 @@ double FstatToLnP(double ff, uint32_t df1, uint32_t df2) {
 
 // Coefficients in rational approximations.
 
-static const double kIvnA[] =
-  {
-    -3.969683028665376e+01,
-    2.209460984245205e+02,
-    -2.759285104469687e+02,
-    1.383577518672690e+02,
-    -3.066479806614716e+01,
-     2.506628277459239e+00
-  };
-
-static const double kIvnB[] =
-  {
-    -5.447609879822406e+01,
-    1.615858368580409e+02,
-    -1.556989798598866e+02,
-    6.680131188771972e+01,
-    -1.328068155288572e+01
-  };
-
-static const double kIvnC[] =
-  {
-    -7.784894002430293e-03,
-    -3.223964580411365e-01,
-    -2.400758277161838e+00,
-    -2.549732539343734e+00,
-    4.374664141464968e+00,
-     2.938163982698783e+00
-  };
-
-static const double kIvnD[] =
-  {
-    7.784695709041462e-03,
-    3.224671290700398e-01,
-    2.445134137142996e+00,
-    3.754408661907416e+00
-  };
-
 static const double kIvnLow = 0.02425;
 static const double kIvnHigh = 0.97575;
 
@@ -1405,25 +1478,325 @@ double QuantileToZscore(double pval) {
     // const double frac = (((((kIvnC[0]*q+kIvnC[1])*q+kIvnC[2])*q+kIvnC[3])*q+kIvnC[4])*q+kIvnC[5]) /
     //   ((((kIvnD[0]*q+kIvnD[1])*q+kIvnD[2])*q+kIvnD[3])*q+1);
     // todo: test this substitute
-    // const double frac = _poly5(q, q2, 2.938163982698783e+00, 4.374664141464968e+00, -2.549732539343734e+00, -2.400758277161838e+00, -3.223964580411365e-01, -7.784894002430293e-03) / _poly4(q, q2, 1, 3.754408661907416e+00, 2.445134137142996e+00, 3.224671290700398e-01, 7.784695709041462e-03);
-    const double numer_rem0 = prefer_fma(prefer_fma(kIvnC[1], q2, kIvnC[3]), q2, kIvnC[5]);
-    const double numer_rem1 = q * prefer_fma(prefer_fma(kIvnC[0], q2, kIvnC[2]), q2, kIvnC[4]);
-    const double denom_rem0 = prefer_fma(prefer_fma(kIvnD[0], q2, kIvnD[2]), q2, 1);
-    const double denom_rem1 = q * prefer_fma(kIvnD[1], q2, kIvnD[3]);
-    const double frac = (numer_rem0 + numer_rem1) / (denom_rem0 + denom_rem1);
+    const double frac = _poly5(q, q2, 2.938163982698783e+00, 4.374664141464968e+00, -2.549732539343734e+00, -2.400758277161838e+00, -3.223964580411365e-01, -7.784894002430293e-03) / _poly4(q, q2, 1, 3.754408661907416e+00, 2.445134137142996e+00, 3.224671290700398e-01, 7.784695709041462e-03);
     return (pval < kIvnLow)? frac : -frac;
   }
   // Rational approximation for central region
   const double q = pval - 0.5;
   const double q2 = q*q;
-  // todo: test this substitute
-  // return q * POLY5(q2, 2.506628277459239e+00, -3.066479806614716e+01, 1.383577518672690e+02, -2.759285104469687e+02, 2.209460984245205e+02, -3.969683028665376e+01) / POLY5(q2, 1, -1.328068155288572e+01, 6.680131188771972e+01, -1.556989798598866e+02, 1.615858368580409e+02, -5.447609879822406e+01);
-  const double q4 = q2*q2;
-  const double numer_rem1 = prefer_fma(prefer_fma(kIvnA[1], q4, kIvnA[3]), q4, kIvnA[5]);
-  const double numer_rem3 = q2 * prefer_fma(prefer_fma(kIvnA[0], q4, kIvnA[2]), q4, kIvnA[4]);
-  const double denom_rem0 = prefer_fma(prefer_fma(kIvnB[1], q4, kIvnB[3]), q4, 1);
-  const double denom_rem2 = q2 * prefer_fma(prefer_fma(kIvnB[0], q4, kIvnB[2]), q4, kIvnB[4]);
-  return q * (numer_rem1 + numer_rem3) / (denom_rem0 + denom_rem2);
+  return q * POLY5(q2, 2.506628277459239e+00, -3.066479806614716e+01, 1.383577518672690e+02, -2.759285104469687e+02, 2.209460984245205e+02, -3.969683028665376e+01) / POLY5(q2, 1, -1.328068155288572e+01, 6.680131188771972e+01, -1.556989798598866e+02, 1.615858368580409e+02, -5.447609879822406e+01);
+}
+
+intptr_t HypergeomCompare(uint64_t obs_m11, uint64_t obs_m12, uint64_t obs_m21, uint64_t obs_m22, int64_t m22_incr, td_real* neg_numer_tdr_ptr, double* dbl_ptr) {
+  // Likelihood ratio of interest is
+  //
+  //           obs_m11! obs_m12! obs_m21! obs_m22!
+  //   ---------------------------------------------------
+  //   (obs_m11+j)! (obs_m12-j)! (obs_m21-j)! (obs_m22+j)!
+  //
+  // where j=m22_incr.
+  //
+  // Note that HWE kind of maps to this, via
+  //   m11 := obs_hets*0.5
+  //   m12 := obs_hom1
+  //   m21 := obs_hom2
+  //   m22 := (obs_hets-1)*0.5
+  uint64_t numer_factorial_args[4];
+  numer_factorial_args[0] = obs_m11;
+  numer_factorial_args[1] = obs_m12;
+  numer_factorial_args[2] = obs_m21;
+  numer_factorial_args[3] = obs_m22;
+  uint64_t denom_factorial_args[4];
+  denom_factorial_args[0] = obs_m11 + m22_incr;
+  denom_factorial_args[1] = obs_m12 - m22_incr;
+  denom_factorial_args[2] = obs_m21 - m22_incr;
+  denom_factorial_args[3] = obs_m22 + m22_incr;
+  td_real ln_odds_ratio_tdr = tdr_make1(0.0);
+  return CompareFactorialProducts(4, tdr_make1(1.0), 0, 0, numer_factorial_args, denom_factorial_args, neg_numer_tdr_ptr, &ln_odds_ratio_tdr, dbl_ptr);
+}
+
+// obs_m11 + obs_m12 + obs_m21 + obs_m22 assumed to be <2^31.  This is mostly
+// copied from github.com/chrchang/stats ; accurate support for the largest
+// arguments has been ripped out.
+// They're defined as int64_ts instead of uint64_ts since signed int <->
+// floating-point conversions are sometimes faster than the same-width unsigned
+// int <-> floating-point conversions.
+double Fisher22TwoSidedP(int64_t obs_m11, int64_t obs_m12, int64_t obs_m21, int64_t obs_m22, int32_t midp, uint32_t logp) {
+  // Normalize: m11 >= m22, m12 >= m21, m11*m22 <= m12*m21.
+  // Note that the first two are reversed from PLINK 1.9, to get rid of
+  // spurious index differences between Fisher22 and Fisher23.
+  if (obs_m11 < obs_m22) {
+    swap_i64(&obs_m11, &obs_m22);
+  }
+  if (obs_m12 < obs_m21) {
+    swap_i64(&obs_m12, &obs_m21);
+  }
+  if (ddr_gt(ddr_mul2d(obs_m11, obs_m22), ddr_mul2d(obs_m12, obs_m21))) {
+    swap_i64(&obs_m11, &obs_m12);
+    swap_i64(&obs_m21, &obs_m22);
+  }
+  // I experimented with making more int -> double casts explicit, but
+  // concluded that it was hurting readability more than it was helping.
+  double m11 = obs_m11;
+  double m12 = obs_m12;
+  double m21 = obs_m21;
+  double m22 = obs_m22;
+  if (!midp) {
+    // Fast path for p=1.
+    if (ddr_geq(ddr_mul2d(m11 + 1, m22 + 1), ddr_mul2d(m12, m21))) {
+      return logp? 0.0 : 1.0;
+    }
+  }
+
+  // Iterate outward to floating-point precision limit.
+  double lik = 1;
+  double tail_sum = 1 - 0.5 * midp;
+  while (1) {
+    m12 += 1;
+    m21 += 1;
+    lik *= (m11 * m22) / (m12 * m21);
+    m11 -= 1;
+    m22 -= 1;
+    const double preadd = tail_sum;
+    tail_sum += lik;
+    if (tail_sum == preadd) {
+      break;
+    }
+  }
+  // In the common case, where we're close enough to the mode that float64
+  // underflow/overflow isn't an issue, use the original algorithm: sum all
+  // center relative-likelihoods, sum far-tail relative-likelihoods to
+  // floating-point precision limit, return
+  //   log(tail_sum / (tail_sum + center_sum))
+  //
+  // bugfix (8 Aug 2026): previous 172-steps-from-mode check doesn't prevent
+  // overflow for obs_m12 huge, obs_m21 <= 172
+  const double first_inward_mult = S_CAST(double, obs_m12) * S_CAST(double, obs_m21) / (S_CAST(double, obs_m11 + 1) * S_CAST(double, obs_m22 + 1));
+  const double m1x = obs_m11 + obs_m12;
+  const double m2x = obs_m21 + obs_m22;
+  const double mx1 = obs_m11 + obs_m21;
+  const double mxx = m1x + m2x;
+  const double modal_m21 = m2x * mx1 / mxx;
+  if ((first_inward_mult <= 1) || ((m21 - modal_m21) * log(first_inward_mult) < 672)) {
+    lik = 1;
+    m11 = obs_m11;
+    m12 = obs_m12;
+    m21 = obs_m21;
+    m22 = obs_m22;
+    double center_sum = 0.5 * midp;
+    double one_plus_scaled_eps = 1 + k2m52;
+    while (1) {
+      m11 += 1;
+      m22 += 1;
+      lik *= (m12 * m21) / (m11 * m22);
+      m12 -= 1;
+      m21 -= 1;
+      one_plus_scaled_eps += 2 * k2m52;
+      if (lik < one_plus_scaled_eps) {
+        if (lik <= 2 - one_plus_scaled_eps) {
+          tail_sum += lik;
+          break;
+        }
+        // Near-tie.  True value of lik can be greater than, equal to, or
+        // less than 1.
+        const int64_t m22_incr = S_CAST(int64_t, m22) - obs_m22;
+        td_real starting_lnprobv_tdr = tdr_make1(DBL_MAX);
+        const intptr_t cmp_result = HypergeomCompare(obs_m11, obs_m12, obs_m21, obs_m22, m22_incr, &starting_lnprobv_tdr, &lik);
+        if (cmp_result <= 0) {
+          tail_sum += lik;
+          if (midp && (cmp_result == 0)) {
+            tail_sum -= 0.5;
+            center_sum += 0.5;
+          }
+          break;
+        }
+        one_plus_scaled_eps = 1 + 3 * k2m52;
+      }
+      center_sum += lik;
+    }
+    // Continue down tail to floating-point precision limit.
+    while (1) {
+      m11 += 1;
+      m22 += 1;
+      lik *= (m12 * m21) / (m11 * m22);
+      m12 -= 1;
+      m21 -= 1;
+      const double preadd = tail_sum;
+      tail_sum += lik;
+      if (tail_sum == preadd) {
+        break;
+      }
+    }
+    const double pval = tail_sum / (tail_sum + center_sum);
+    return logp? log(pval) : pval;
+  }
+
+  // Now we want to jump near the other tail, without evaluating that many
+  // contingency table log-likelihoods along the way.
+  //
+  // Each full log-likelihood evaluation requires 4 ddr_lfact() or tdr_lfact()
+  // calls.  Since they are now performed with extra precision, they require
+  // hundreds or thousands of floating-point operations, so we want to limit
+  // ourselves to 1-2 full evaluations most of the time.  (Possible todo: use
+  // lower-accuracy Lfact() to jump around, followed by {d,t}dr_lfact() when
+  // exiting the loop.  Should be an easy performance win, but there's a
+  // complexity cost so I'll wait until I see a scenario where this branch
+  // executes frequently...)
+  //
+  // The current heuristic starts by reflecting (obs_m21 + m21) * 0.5 across
+  // the mode, performing a full log-likelihood check at an adjacent valid
+  // point.  (It is convenient to focus on m21 here, since m21=0 corresponds to
+  // the outermost table on this tail.)  Hopefully we find that we're in
+  // (starting_lnprob - lnprobv_diff_min, starting_lnprob], so we're at or
+  // near a table that actually contributes to the tail-sum.  (This window is
+  // chosen to be wide enough to guarantee that at least one point falls
+  // inside.)
+  //
+  // If not, we jump again, using Newton's method.
+  // If m21 is too high (i.e. current log-likelihood is too high), decreasing
+  // m12 by 1 would multiply the likelihood by
+  //   (m11 + 1) * (m22 + 1) / (m12 * m21)
+  // If m12 is too low, increasing m12 by 1 would multiply the likelihood by
+  //   (m12 + 1) * (m21 + 1) / (m11 * m22)
+  // We use the negative-log of the first expression as the Newton's method
+  // f'(x) when we're jumping to lower m12, and the log of the second
+  // expression when we're jumping to higher m12.
+  // f''(x) is always negative, so we can aim for starting_lnprob instead of
+  // the middle of the interval.
+
+  const double m12_minus_m21 = obs_m12 - obs_m21;
+  {
+    // x=modal_m21 satisfies
+    //    (m2x - x) * (mx1 - x) = x * (x + m12_minus_m21)
+    // -> (x - m2x) * (x - mx1) = x * (x + m12_minus_m21)
+    // -> x^2 + x*(-m2x - mx1) + m2x*mx1 = x^2 + x*m12_minus_m21
+    // -> m2x*mx1 = x*(m12_minus_m21 + m2x + mx1)
+    // -> x = m2x*mx1 / mxx
+    m21 = 2 * modal_m21 - (m21 + obs_m21) * 0.5;
+    // Round down (to guarantee we've actually moved to the other side of the
+    // mode) and clamp.
+    m21 = S_CAST(int64_t, m21);
+    if (m21 < 0) {
+      m21 = 0;
+    }
+  }
+  // Extremal case: m11=mx1, m12=m12_minus_m21, m21=0, m22=m2x
+  //   log((m12 + 1) * (m21 + 1) / (m11 * m22))
+  // = log((m12_minus_m21 + 1) / (mx1 * m2x))
+  double lnprobv_diff_min = log((m12_minus_m21 + 1) / (mx1 * m2x)) * (1 + kSmallEpsilon);
+  const dd_real starting_lnprobv_ddr = ddr_negate(ddr_sort_and_add_4_lfacts(obs_m11, obs_m12, obs_m21, obs_m22));
+
+  const dd_real lnprobf_ddr =
+    ddr_sub(ddr_sort_and_add_4_lfacts(m1x, m2x, mx1, obs_m12 + obs_m22),
+            ddr_lfact(mxx));
+  dd_real starting_lnprob_ddr = ddr_add(lnprobf_ddr, starting_lnprobv_ddr);
+  while (1) {
+    m11 = mx1 - m21;
+    m12 = m12_minus_m21 + m21;
+    m22 = m2x - m21;
+    const dd_real lnprobv_ddr =
+      ddr_negate(ddr_sort_and_add_4_lfacts(m11, m12, m21, m22));
+    double lnprobv_diff = ddr_sub(lnprobv_ddr, starting_lnprobv_ddr).x[0];
+    // Could tighten this threshold further.  But code is correct as long as
+    // we're guaranteed to enter the "lik < 2 - one_minus_scaled_eps" branch
+    // for positive lnprobv_diff.
+    if (lnprobv_diff >= k2m53) {
+      if (m21 == 0) {
+        // All tables on this tail have higher likelihood than the starting
+        // table.  Exit.
+        return join_log_and_nonlog(starting_lnprob_ddr, tail_sum, logp);
+      }
+      const double ll_deriv = log(m12 * m21 / ((m11 + 1) * (m22 + 1)));
+      // Round up, to guarantee that we make progress.
+      // (lnprobv_diff is positive and ll_deriv is negative.)
+      // This may overshoot.  But the function is guaranteed to terminate
+      // because we never overshoot (and we do always make progress on each
+      // step) once we're on the other side.
+      m21 -= ceil(-lnprobv_diff / ll_deriv);
+      if (m21 < 0) {
+        m21 = 0;
+      }
+    } else {
+      double ll_deriv = DBL_MAX;
+      if ((lnprobv_diff_min < -53 * kLn2) && (m21 > 0)) {
+        // Tighten this threshold if that lets us sum fewer terms later.
+        ll_deriv = log((m12 + 1) * (m21 + 1) / (m11 * m22));
+        lnprobv_diff_min = ll_deriv * (1 + kSmallEpsilon);
+      }
+      if (lnprobv_diff > lnprobv_diff_min) {
+        lik = exp(lnprobv_diff);
+        break;
+      }
+      if (ll_deriv == DBL_MAX) {
+        ll_deriv = log((m12 + 1) * (m21 + 1) / (m11 * m22));
+      }
+      // Round down, to guarantee we don't overshoot.
+      // We're guaranteed to make progress because of how lnprobv_diff_min
+      // was set.
+      // m11 * m22 < exp(-lnprobv_diff_min), and (m12 + 1) * (m21 + 1) >= 1.
+      m21 += S_CAST(int64_t, lnprobv_diff / ll_deriv);
+    }
+  }
+  // Sum toward center, until lik >= 1.
+  // lik should be accurate to 3 ULP as we enter this loop (max 1.5 ULP
+  // observed error from exp, tiny bit over 0.5 from lnprobv_diff), so near-tie
+  // detection can use a tight epsilon here.
+  double one_minus_scaled_eps = 1 - 3 * k2m52;
+  // Save where we're starting on this tail, which isn't necessarily on the
+  // boundary.  We sum inward until relative-likelihood > 1, then we jump back
+  // to tailenter_{m11,m12,m21,m22} and sum outward.
+  const double tailenter_lik = lik;
+  const double tailenter_m11 = m11;
+  const double tailenter_m12 = m12;
+  const double tailenter_m21 = m21;
+  const double tailenter_m22 = m22;
+  td_real starting_lnprobv_tdr = tdr_make_dd(starting_lnprobv_ddr);
+  starting_lnprobv_tdr.x[2] = DBL_MAX;
+  while (1) {
+    while (lik <= one_minus_scaled_eps) {
+    Fisher22TwoSidedP_rtail_instep:
+      tail_sum += lik;
+      m12 += 1;
+      m21 += 1;
+      lik *= m11 * m22 / (m12 * m21);
+      m11 -= 1;
+      m22 -= 1;
+      one_minus_scaled_eps -= 2 * k2m52;
+    }
+    if (lik >= 2 - one_minus_scaled_eps) {
+      break;
+    }
+    const int64_t m22_incr = S_CAST(int64_t, m22) - obs_m22;
+    const intptr_t cmp_result = HypergeomCompare(obs_m11, obs_m12, obs_m21, obs_m22, m22_incr, &starting_lnprobv_tdr, &lik);
+    if (cmp_result >= 0) {
+      if (cmp_result == 0) {
+        tail_sum += 1 - 0.5 * midp;
+      }
+      break;
+    }
+    one_minus_scaled_eps = 1 - 3 * k2m52;
+    // bugfix (8 Aug 2026): must take one step when lik in (1 - 3*2^{-52}, 1).
+    goto Fisher22TwoSidedP_rtail_instep;
+  }
+  // Sum away from center, until sums stop changing.
+  lik = tailenter_lik;
+  m11 = tailenter_m11;
+  m12 = tailenter_m12;
+  m21 = tailenter_m21;
+  m22 = tailenter_m22;
+  while (1) {
+    m11 += 1;
+    m22 += 1;
+    lik *= m12 * m21 / (m11 * m22);
+    const double preadd = tail_sum;
+    tail_sum += lik;
+    if (tail_sum == preadd) {
+      break;
+    }
+    m12 -= 1;
+    m21 -= 1;
+  }
+  return join_log_and_nonlog(starting_lnprob_ddr, tail_sum, logp);
 }
 
 // - If non-null, *starting_lnprobv_ddr_ptr is expected to be initialized to

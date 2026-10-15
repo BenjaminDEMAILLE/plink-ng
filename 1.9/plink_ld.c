@@ -1625,9 +1625,7 @@ int32_t flipscan(Ld_info* ldip, FILE* bedfile, uintptr_t bed_offset, uintptr_t m
   }
   ulii = (max_window_size + 1) * 2;
   for (uljj = 0; uljj < max_window_size; uljj++) {
-    neg_uidx_buf[uljj * ulii] = 0.0;
-    neg_uidx_buf[uljj * ulii + 1] = 0.0;
-    // bugfix: initialize r_matrix diagonal
+    // initialize r_matrix diagonal
     r_matrix[uljj * ulii] = 0.0;
     r_matrix[uljj * ulii + 1] = 0.0;
   }
@@ -1692,6 +1690,10 @@ int32_t flipscan(Ld_info* ldip, FILE* bedfile, uintptr_t bed_offset, uintptr_t m
     window_cidx = max_window_size - 1;
     window_cidx2 = 0;
     do {
+      // window_cidx: current variant
+      // window_cidx2: trailing variant in window
+      // window_cidx3: temporary index for LD calcs between trailing variants
+      //               and current variant
       if (++window_cidx == max_window_size) {
 	window_cidx = 0;
       }
@@ -1780,12 +1782,24 @@ int32_t flipscan(Ld_info* ldip, FILE* bedfile, uintptr_t bed_offset, uintptr_t m
       }
       // only need to enforce window locus count constraint during first loop
       // iteration
-      ulii = window_cidx2 + max_window_locus_ct;
-      if (ulii >= max_window_size) {
-	ulii -= max_window_size;
+      // bugfix (10 Sep 2026): max_window_size is the largest number of markers
+      // the bp window can hold, so when it is no larger than
+      // max_window_locus_ct, the locus count constraint cannot bind and the
+      // circular-buffer arithmetic below does not describe it.  Reducing
+      // window_cidx2 + max_window_locus_ct by a single max_window_size in that
+      // case made the trailing marker flush after only
+      // (max_window_locus_ct % max_window_size) further markers, silently
+      // shrinking every window.
+      uint32_t count_flush = 0;
+      if (max_window_locus_ct < max_window_size) {
+        ulii = window_cidx2 + max_window_locus_ct;
+        if (ulii >= max_window_size) {
+          ulii -= max_window_size;
+        }
+        count_flush = (ulii == window_cidx);
       }
       marker_uidx2 = window_uidxs[window_cidx2];
-      if ((ulii == window_cidx) || (marker_pos[marker_uidx2] < marker_pos_thresh)) {
+      if (count_flush || (marker_pos[marker_uidx2] < marker_pos_thresh)) {
 	do {
 	  pos_r_tot = 0.0;
 	  neg_r_tot = 0.0;
@@ -1801,7 +1815,8 @@ int32_t flipscan(Ld_info* ldip, FILE* bedfile, uintptr_t bed_offset, uintptr_t m
 	      if (case_pheno * ctrl_pheno >= 0.0) {
                 pos_r_ct++;
 		pos_r_tot += dxx;
-	      } else {
+	      } else if (dxx == dxx) {
+                // bugfix (4 Sep 2026): need to ignore nan here
 		neg_uidx_buf[neg_r_ct++] = window_uidxs[window_cidx3];
 		neg_r_tot += dxx;
 	      }
@@ -3731,6 +3746,11 @@ double fepi_counts_to_boost_chisq(uint32_t* counts, double* p_bc, double* p_ca, 
       }
     }
     interaction_measure = (interaction_measure + log(tau)) * ((int32_t)(sum * 2));
+    if (interaction_measure < 0.0) {
+      // rounding error when the no-interaction fit is exact; a negative
+      // statistic would otherwise be reported with P = 0
+      interaction_measure = 0.0;
+    }
     memcpy(ularr, &interaction_measure, sizeof(double));
     // save df_adj in low two bits
     ularr[0] &= ~(3 * ONELU);
@@ -4992,7 +5012,7 @@ uint32_t em_phase_hethet(double known11, double known12, double known21, double 
 	incr_1122 = solutions[cur_sol_idx];
         cur_lnlike = calc_lnlike(known11, known12, known21, known22, center_ct_d, freq11, freq12, freq21, freq22, half_hethet_share, incr_1122);
 	if (cur_lnlike > best_lnlike) {
-          cur_lnlike = best_lnlike;
+          best_lnlike = cur_lnlike;
           best_sol = incr_1122;
 	}
       } while (++cur_sol_idx < sol_end_idx);
@@ -5691,7 +5711,7 @@ int32_t ld_report_regular(pthread_t* threads, Ld_info* ldip, FILE* bedfile, uint
   uintptr_t max_marker_id_len = g_ld_max_marker_id_len;
   uint32_t ld_modifier = ldip->modifier;
   uint32_t output_gz = ld_modifier & LD_REPORT_GZ;
-  uint32_t ignore_x = (ld_modifier & LD_IGNORE_X) & 1;
+  uint32_t ignore_x = (ld_modifier / LD_IGNORE_X) & 1;
   uint32_t is_inter_chr = ld_modifier & LD_INTER_CHR;
   uint32_t snp_list_file = ld_modifier & LD_SNP_LIST_FILE;
   uintptr_t marker_ct = g_ld_marker_ct;
@@ -6368,7 +6388,7 @@ int32_t show_tags(Ld_info* ldip, FILE* bedfile, uintptr_t bed_offset, uintptr_t 
   double tag_thresh = ldip->show_tags_r2 * (1 - SMALL_EPSILON);
   uint32_t tags_list = (ldip->modifier & LD_SHOW_TAGS_LIST_ALL) || (!ldip->show_tags_fname);
   uint32_t twocolumn = ldip->modifier & LD_SHOW_TAGS_MODE2;
-  uint32_t ignore_x = (ldip->modifier & LD_IGNORE_X) & 1;
+  uint32_t ignore_x = (ldip->modifier / LD_IGNORE_X) & 1;
   uint32_t window_bp = ldip->show_tags_bp;
   uint32_t target_ct = 0;
   uint32_t chrom_name_len = 0;
@@ -11479,6 +11499,12 @@ int32_t test_mishap(FILE* bedfile, uintptr_t bed_offset, char* outname, char* ou
     if (load_and_collapse(unfiltered_sample_ct, sample_ct, sample_exclude, final_mask, IS_SET(marker_reverse, marker_uidx_cur), bedfile, loadbuf_raw, cursnp_ptr)) {
       goto test_mishap_ret_READ_FAIL;
     }
+    // bugfix (7 Sep 2026)
+    if (marker_uidx_next > marker_uidx_cur + 1) {
+      if (fseeko(bedfile, bed_offset + marker_uidx_next * ((uint64_t)unfiltered_sample_ct4), SEEK_SET)) {
+        goto test_mishap_ret_READ_FAIL;
+      }
+    }
     missing_ct_cur = count_01(cursnp_ptr, sample_ctl2);
     marker_uidx_prev = ~ZEROLU;
     for (; marker_uidx_cur < chrom_end; marker_uidx_prev = marker_uidx_cur, marker_uidx_cur = marker_uidx_next, prevsnp_ptr = cursnp_ptr, cursnp_ptr = nextsnp_ptr, missing_ct_cur = missing_ct_next, marker_uidx_next++) {
@@ -11507,14 +11533,14 @@ int32_t test_mishap(FILE* bedfile, uintptr_t bed_offset, char* outname, char* ou
       if (missing_ct_cur < 5) {
 	continue;
       }
-      quatervec_copy_only_01(cursnp_ptr, unfiltered_sample_ct, maskbuf_mid);
+      quatervec_copy_only_01(cursnp_ptr, sample_ct, maskbuf_mid);
       uiptr = counts;
       for (uii = 0; uii < 2; uii++) {
 	if (uii) {
-	  quatervec_01_invert(unfiltered_sample_ct, maskbuf_mid);
+	  quatervec_01_invert(sample_ct, maskbuf_mid);
 	}
         for (ujj = 0; ujj < 3; ujj++) {
-          vec_datamask(unfiltered_sample_ct, ujj + (ujj + 1) / 2, prevsnp_ptr, maskbuf_mid, maskbuf);
+          vec_datamask(sample_ct, ujj + (ujj + 1) / 2, prevsnp_ptr, maskbuf_mid, maskbuf);
 	  ukk = popcount01_longs(maskbuf, sample_ctl2);
 	  genovec_3freq(nextsnp_ptr, maskbuf, sample_ctl2, &umm, &(uiptr[1]), &(uiptr[2]));
 	  uiptr[0] = ukk - umm - uiptr[1] - uiptr[2];
@@ -13478,7 +13504,7 @@ int32_t clump_reports(FILE* bedfile, uintptr_t bed_offset, char* outname, char* 
 	      cc_ptr->marker_idx = marker_idx;
 	      uii = clump_entry_ptr->fidx;
 	      cc_ptr->fidx = uii;
-	      if ((uii == best_fidx_match) && (fabs(cur_r2) > max_r2)) {
+	      if ((uii == best_fidx_match) && ((!best_entry_ptr) || (fabs(cur_r2) > fabs(max_r2)))) {
 		max_r2 = cur_r2;
 		max_r2_uidx = marker_uidx;
 		best_entry_ptr = clump_entry_ptr;
@@ -13605,7 +13631,7 @@ int32_t clump_reports(FILE* bedfile, uintptr_t bed_offset, char* outname, char* 
 	      cc_ptr->marker_idx = marker_idx;
 	      uii = clump_entry_ptr->fidx;
 	      cc_ptr->fidx = uii;
-	      if ((uii == best_fidx_match) && (fabs(cur_r2) > max_r2)) {
+	      if ((uii == best_fidx_match) && ((!best_entry_ptr) || (fabs(cur_r2) > fabs(max_r2)))) {
 		max_r2 = cur_r2;
 		max_r2_uidx = marker_uidx;
 		best_entry_ptr = clump_entry_ptr;

@@ -2,7 +2,7 @@
 #define __PLINK2_MERGE_H__
 
 // This file is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This program is free software: you can redistribute it and/or modify it
 // under the terms of the GNU General Public License as published by the Free
@@ -37,9 +37,11 @@ FLAGSET_DEF_START()
   kfPmergeSampleInnerJoin = (1 << 0),
   kfPmergeVariantInnerJoin = (1 << 1),
   kfPmergePhenoInnerJoin = (1 << 2),
-  kfPmergeSids = (1 << 3),
-  kfPmergeMultiallelicsAlreadyJoined = (1 << 4),
-  kfPmergeOutputVzs = (1 << 5)
+  kfPmergeIgnorePhase = (1 << 3),
+  kfPmergeIgnoreDosage = (1 << 4),
+  kfPmergeSids = (1 << 5),
+  kfPmergeMultiallelicsAlreadyJoined = (1 << 6),
+  kfPmergeOutputVzs = (1 << 7)
 FLAGSET_DEF_END(PmergeFlags);
 
 ENUM_U31_DEF_START()
@@ -112,6 +114,10 @@ FLAGSET_DEF_START()
   kfPgenDiffColAll = ((kfPgenDiffColGeno * 2) - kfPgenDiffColPos)
 FLAGSET_DEF_END(PgenDiffFlags);
 
+// Non-concatenating --pmerge[-list] jobs with more filesets than this are
+// performed in multiple passes.
+CONSTI32(kPmergeMaxPassFilesetCt, 20);
+
 typedef struct PmergeStruct {
   NONCOPYABLE(PmergeStruct);
   PmergeFlags flags;
@@ -128,6 +134,10 @@ typedef struct PmergeStruct {
   SortMode merge_pheno_sort;
   SortMode merge_info_sort;
   uint32_t max_allele_ct;
+  // Maximum number of filesets merged at once by a non-concatenating
+  // --pmerge[-list]; 0 = kPmergeMaxPassFilesetCt.  Only overridden (by the
+  // pmerge-pass-size= modifier of --debug) for testing.
+  uint32_t max_pass_fileset_ct;
   char* pgen_fname;
   char* pvar_fname;
   char* psam_fname;

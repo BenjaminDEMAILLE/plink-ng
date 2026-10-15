@@ -2,7 +2,7 @@
 #define __PLINK2_BASE_H__
 
 // This library is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This library is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by the
@@ -113,7 +113,7 @@
 // 10000 * major + 100 * minor + patch
 // Exception to CONSTI32, since we want the preprocessor to have access
 // to this value.  Named with all caps as a consequence.
-#define PLINK2_BASE_VERNUM 903
+#define PLINK2_BASE_VERNUM 906
 
 // We now try to adhere to include-what-you-use in simple cases.  However,
 // we don't want to repeat either platform-specific ifdefs, or stuff like
@@ -2324,8 +2324,12 @@ HEADER_INLINE uint32_t GetVint31(const unsigned char* buf_end, const unsigned ch
         return vint32;
       }
       shift += 7;
-      // currently don't check for shift >= 32 (that's what ValidateVint31()
-      // is for).
+      if (unlikely(shift == 35)) {
+        // Value doesn't fit in 31 bits, so it can't be legitimate; report it
+        // the same way as read-past-end, instead of shifting by >= 32 (which
+        // is undefined behavior).  ValidateVint31() has the same cutoff.
+        return 0x80000000U;
+      }
     }
   }
   return 0x80000000U;

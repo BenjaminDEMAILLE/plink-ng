@@ -2,7 +2,7 @@
 #define __PLINK2_LD_H__
 
 // This file is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This program is free software: you can redistribute it and/or modify it
 // under the terms of the GNU General Public License as published by the Free
@@ -32,9 +32,9 @@ FLAGSET_DEF_START()
   kfLdPruneWindowBp = (1 << 0),
   kfLdPrunePairwise = (1 << 1),
   kfLdPrunePairphase = (1 << 2),
-  kfLdPrunePlink1Order = (1 << 3)
+  kfLdPrunePlink1Order = (1 << 3),
+  kfLdPruneVif = (1 << 4)
 FLAGSET_DEF_END(LdPruneFlags);
-// todo: old multicollinearity test
 
 FLAGSET_DEF_START()
   kfClump0,
@@ -104,6 +104,37 @@ FLAGSET_DEF_END(VcorFlags);
 CONSTI32(kClumpMaxBinBounds, 0x4000000);
 
 FLAGSET_DEF_START()
+  kfFlipScan0,
+  kfFlipScanVerbose = (1 << 0),
+  kfFlipScanZs = (1 << 1),
+  // Report REF frequencies rather than major-allele frequencies, and name the
+  // columns accordingly.
+  kfFlipScanRefBased = (1 << 2),
+  // Compare signed D' between cases and controls instead of r.
+  kfFlipScanDprime = (1 << 3),
+
+  kfFlipScanColChrom = (1 << 4),
+  kfFlipScanColPos = (1 << 5),
+  kfFlipScanColRef = (1 << 6),
+  kfFlipScanColAlt = (1 << 7),
+  kfFlipScanColMaybeprovref = (1 << 8),
+  kfFlipScanColProvref = (1 << 9),
+  kfFlipScanColA1 = (1 << 10),
+  // Add kfFlipScanColAx (all alleles except A1, see --hardy) if anyone wants
+  // it.
+  kfFlipScanColFreqbase = (1 << 11),
+  kfFlipScanColFreqs = (1 << 12),
+  kfFlipScanColPosct = (1 << 13),
+  kfFlipScanColRpos = (1 << 14),
+  kfFlipScanColNegct = (1 << 15),
+  kfFlipScanColRneg = (1 << 16),
+  kfFlipScanColNegids = (1 << 17),
+  kfFlipScanColProblem = (1 << 18),
+  kfFlipScanColDefault = (kfFlipScanColChrom | kfFlipScanColPos | kfFlipScanColRef | kfFlipScanColAlt | kfFlipScanColMaybeprovref | kfFlipScanColA1 | kfFlipScanColFreqs | kfFlipScanColPosct | kfFlipScanColRpos | kfFlipScanColNegct | kfFlipScanColRneg | kfFlipScanColProblem | kfFlipScanColNegids),
+  kfFlipScanColAll = ((kfFlipScanColProblem * 2) - kfFlipScanColChrom)
+FLAGSET_DEF_END(FlipScanFlags);
+
+FLAGSET_DEF_START()
   kfLdConsole0,
   kfLdConsoleHweMidp = (1 << 0)
 FLAGSET_DEF_END(LdConsoleFlags);
@@ -116,6 +147,27 @@ typedef struct LdInfoStruct {
   uint32_t prune_window_incr;
   LdConsoleFlags ld_console_flags;
   STD_ARRAY_DECL(char*, 2, ld_console_varids);
+  FlipScanFlags flipscan_flags;
+  uint32_t flipscan_window_size;
+  uint32_t flipscan_window_bp;
+  double flipscan_thresh;
+  // Redesign parameters: the frequency difference that flags a variant on its
+  // own, the major-allele frequency above which a variant carries too little
+  // information to be worth comparing against, and how many sign-flipped
+  // neighbors it takes to call a variant problematic.
+  // -1 until set, since the default depends on whether the LD scan follows.
+  double flipscan_freq_diff;
+  double flipscan_max_maj_freq;
+  uint32_t flipscan_min_neg_ct;
+  // When set, --flip-scan compares the dataset against these frequencies
+  // instead of splitting it into cases and controls.
+  char* flipscan_ref_freq_fname;
+  char* flipscan_phenoname;
+  // Likewise, but against a second fileset, which allows the LD half of the
+  // scan to run as well.
+  char* flipscan_ref_pgen_fname;
+  char* flipscan_ref_pvar_fname;
+  char* flipscan_ref_psam_fname;
 } LdInfo;
 
 typedef struct ClumpInfoStruct {
@@ -137,6 +189,76 @@ typedef struct ClumpInfoStruct {
   ClumpFlags flags;
 } ClumpInfo;
 
+typedef struct TwolocusInfoStruct {
+  NONCOPYABLE(TwolocusInfoStruct);
+  char* mkr1;
+  char* mkr2;
+  char* pheno_name;
+} TwolocusInfo;
+
+typedef struct TagInfoStruct {
+  NONCOPYABLE(TagInfoStruct);
+  char* tag_fname;   // nullptr in 'all' mode
+  uint32_t list_all;
+  uint32_t mode2;
+  uint32_t bp_radius;
+  uint32_t output_zst;
+  double r2_thresh;
+} TagInfo;
+
+FLAGSET_DEF_START()
+  kfBlocks0,
+  kfBlocksNoSmallMaxSpan = (1 << 0)
+FLAGSET_DEF_END(BlocksFlags);
+
+typedef struct BlocksInfoStruct {
+  BlocksFlags flags;
+  uint32_t max_bp;
+  // 0..100 quantile scale, as PLINK 1.x stores them
+  uint32_t strong_lowci_outer;
+  uint32_t strong_lowci;
+  uint32_t strong_highci;
+  uint32_t recomb_highci;
+  double min_maf;
+  double inform_frac;
+} BlocksInfo;
+
+FLAGSET_DEF_START()
+  kfLdScore0,
+  kfLdScoreZs = (1 << 0),
+
+  kfLdScoreColChrom = (1 << 1),
+  kfLdScoreColPos = (1 << 2),
+  kfLdScoreColNobsi = (1 << 3),
+  kfLdScoreColL2 = (1 << 4),
+  kfLdScoreColDefault = (kfLdScoreColChrom | kfLdScoreColPos | kfLdScoreColL2),
+  kfLdScoreColAll = ((kfLdScoreColL2 * 2) - kfLdScoreColChrom),
+
+  kfLdScoreFounders = (1 << 5),
+  kfLdScoreMultiallelic = (1 << 6)
+FLAGSET_DEF_END(LdScoreFlags);
+
+typedef struct LdScoreInfoStruct {
+  NONCOPYABLE(LdScoreInfoStruct);
+  LdScoreFlags flags;
+  // When present, each variant's LD Score is computed once per annotation
+  // column in this file, weighting each window variant by its value there.
+  char* annot_fname;
+  // Window radius.  LD Score regression's convention is a 1 cM radius, so
+  // that's the default; the variant-count and bp radii are here for the same
+  // reason --ld-window and --ld-window-kb are.
+  uint32_t var_ct_radius;
+  uint32_t bp_radius;
+  double cm_radius;
+} LdScoreInfo;
+
+FLAGSET_DEF_START()
+  kfTestMishap0,
+  kfTestMishapZs = (1 << 0)
+FLAGSET_DEF_END(TestMishapFlags);
+
+PglErr TestMishap(const uintptr_t* orig_variant_include, const ChrInfo* cip, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const AlleleCode* maj_alleles, const char* const* allele_storage, const uintptr_t* sample_include, TestMishapFlags flags, double min_maf, double output_min_ln, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t raw_variant_ct, uint32_t max_variant_id_slen, uint32_t max_allele_slen, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
+
 typedef struct VcorInfoStruct {
   NONCOPYABLE(VcorInfoStruct);
   char* ld_snp_list_fname;
@@ -156,15 +278,43 @@ void InitClump(ClumpInfo* clump_ip);
 
 void CleanupClump(ClumpInfo* clump_ip);
 
+void InitLdScore(LdScoreInfo* lsip);
+
+void CleanupLdScore(LdScoreInfo* lsip);
+
+void InitBlocks(BlocksInfo* bip);
+
+void InitTwolocus(TwolocusInfo* tlip);
+
+void CleanupTwolocus(TwolocusInfo* tlip);
+
+void InitTag(TagInfo* tip);
+
+void CleanupTag(TagInfo* tip);
+
 void InitVcor(VcorInfo* vcip);
 
 void CleanupVcor(VcorInfo* vcip);
+
+PglErr FlipScanRefFreq(const uintptr_t* variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const uintptr_t* nonref_flags, const AlleleCode* maj_alleles, const double* allele_freqs, const LdInfo* ldip, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_allele_ct, uint32_t max_variant_id_slen, uint32_t max_allele_slen, PgenGlobalFlags gflags, uint32_t max_thread_ct, char* outname, char* outname_end);
+
+PglErr FlipScanRefDataset(const uintptr_t* variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const uintptr_t* nonref_flags, const AlleleCode* maj_alleles, const double* allele_freqs, const LdInfo* ldip, LoadFilterLogFlags load_filter_log_flags, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_allele_slen, PgenGlobalFlags gflags, char input_missing_geno_char, uint32_t max_thread_ct, char* outname, char* outname_end);
+
+PglErr FlipScan(const uintptr_t* orig_sample_include, const uintptr_t* sex_male, const PhenoCol* pheno_cols, const char* pheno_names, const uintptr_t* variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const uintptr_t* nonref_flags, const AlleleCode* maj_alleles, const double* allele_freqs, const uintptr_t* founder_info, const LdInfo* ldip, uint32_t raw_sample_ct, uint32_t pheno_ct, uintptr_t max_pheno_name_blen, uint32_t raw_variant_ct, uint32_t allow_bad_ld, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
 
 PglErr LdPrune(const uintptr_t* orig_variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const AlleleCode* maj_alleles, const double* allele_freqs, const uintptr_t* founder_info, const uintptr_t* sex_nm, const uintptr_t* sex_male, const LdInfo* ldip, const char* indep_preferred_fname, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t raw_sample_ct, uint32_t founder_ct, uint32_t nosex_ct, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
 
 PglErr LdConsole(const uintptr_t* variant_include, const ChrInfo* cip, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const AlleleCode* maj_alleles, const uintptr_t* founder_info, const uintptr_t* sex_nm, const uintptr_t* sex_male, const LdInfo* ldip, uint32_t variant_ct, uint32_t raw_sample_ct, uint32_t founder_ct, PgenReader* simple_pgrp);
 
 PglErr ClumpReports(const uintptr_t* orig_variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const uintptr_t* founder_info, const uintptr_t* sex_nm, const uintptr_t* sex_male, const ClumpInfo* clump_ip, uint32_t raw_variant_ct, uint32_t orig_variant_ct, uint32_t raw_sample_ct, uint32_t founder_ct, uint32_t nosex_ct, uint32_t max_variant_id_slen, uint32_t max_allele_slen, double output_min_ln, uint32_t max_thread_ct, uintptr_t pgr_alloc_cacheline_ct, PgenFileInfo* pgfip, PgenReader* simple_pgrp, char* outname, char* outname_end);
+
+PglErr HaploviewBlocks(const uintptr_t* orig_variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const AlleleCode* maj_alleles, const double* allele_freqs, const uintptr_t* founder_info, const BlocksInfo* bip, uint32_t raw_sample_ct, uint32_t founder_ct, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
+
+PglErr ShowTags(const uintptr_t* orig_variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const AlleleCode* maj_alleles, const uintptr_t* founder_info, const char* tag_fname, uint32_t list_all, uint32_t mode2, uint32_t bp_radius, double r2_thresh, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t raw_sample_ct, uint32_t founder_ct, uint32_t max_variant_id_slen, uint32_t output_zst, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
+
+PglErr TwolocusReport(const uintptr_t* sample_include, const uintptr_t* variant_include, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const PhenoCol* pheno_cols, const char* pheno_names, const TwolocusInfo* tlip, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t variant_ct, uint32_t pheno_ct, uintptr_t max_pheno_name_blen, uint32_t max_allele_slen, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
+
+PglErr LdScore(const uintptr_t* orig_variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const double* variant_cms, const uintptr_t* allele_idx_offsets, const AlleleCode* maj_alleles, const uintptr_t* founder_info, const LdScoreInfo* lsip, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t raw_sample_ct, uint32_t founder_ct, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
 
 PglErr Vcor(const uintptr_t* orig_variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const double* variant_cms, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const AlleleCode* maj_alleles, const double* allele_freqs, const uintptr_t* founder_info, const uintptr_t* sex_nm, const uintptr_t* sex_male, const VcorInfo* vcip, uint32_t raw_variant_ct, uint32_t orig_variant_ct, uint32_t raw_sample_ct, uint32_t founder_ct, uint32_t max_variant_id_slen, uint32_t max_allele_slen, uint32_t parallel_idx, uint32_t parallel_tot, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
 

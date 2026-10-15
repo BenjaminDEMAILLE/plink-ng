@@ -2,7 +2,7 @@
 #define __PLINK2_BITS_H__
 
 // This library is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This library is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by the
@@ -335,8 +335,11 @@ void UidxsToIdxs(const uintptr_t* subset_mask, const uint32_t* subset_cumulative
 
 // These functions do not overread, but may write extra bytes up to the word
 // boundary.
+
+// incr currently must be in [0, 254].
 void Expand1bitTo8(const void* __restrict bytearr, uint32_t input_bit_ct, uint32_t incr, void* __restrict dst);
 
+// all incrs (in [0, 0xffff]) supported.
 void Expand1bitTo16(const void* __restrict bytearr, uint32_t input_bit_ct, uint32_t incr, void* __restrict dst);
 
 
@@ -519,6 +522,7 @@ HEADER_INLINE void CopyBitarr(const uintptr_t* __restrict src, uintptr_t bit_ct,
 // output_bit_idx_end is practically always subset_size
 // if not, it currently must correspond to PopcountWords(subset_mask, word_ct)
 // for some word_ct
+// Trailing output bits are guaranteed to be clear.
 void CopyBitarrSubset(const uintptr_t* __restrict raw_bitarr, const uintptr_t* __restrict subset_mask, uint32_t output_bit_idx_end, uintptr_t* __restrict output_bitarr);
 
 #ifndef NO_UNALIGNED
@@ -529,7 +533,11 @@ HEADER_INLINE void CopyBitarrSubsetToUnaligned(const uintptr_t* __restrict raw_b
 void CopyBitarrSubsetToUnaligned(const uintptr_t* __restrict raw_bitarr, const uintptr_t* __restrict subset_mask, uint32_t output_bit_idx_end, void* __restrict output_bitarr);
 #endif
 
-// expand_size + read_start_bit must be positive.
+// Expands compact_bitarr bits [read_start_bit, read_start_bit + expand_size)
+// to target words [0, word_ct), using expand_mask.
+// * expand_mask[] must contain exactly expand_size set bits over word_ct
+//   words.
+// * expand_size + read_start_bit must be positive.
 void ExpandBytearr(const void* __restrict compact_bitarr, const uintptr_t* __restrict expand_mask, uint32_t word_ct, uint32_t expand_size, uint32_t read_start_bit, uintptr_t* __restrict target);
 
 // equivalent to calling ExpandBytearr() followed by CopyBitarrSubset()
@@ -544,7 +552,17 @@ void ExpandThenSubsetBytearrNested(const void* __restrict compact_bitarr, const 
 
 // these don't read past the end of bitarr
 uintptr_t PopcountBytes(const void* bitarr, uintptr_t byte_ct);
+
 uintptr_t PopcountBytesMasked(const void* bitarr, const uintptr_t* mask_arr, uintptr_t byte_ct);
+
+// Errors out if any trailing bits are set, or result is 0; this lines up with
+// multiallelic-data-track validation.
+HEADER_INLINE BoolErr PopcountBytesCheckedNz32(const void* bitarr, uint32_t byte_ct, uint32_t bit_ct, uint32_t* result_ptr) {
+  const uint32_t remainder = bit_ct % CHAR_BIT;
+  const uint32_t result = PopcountBytes(bitarr, byte_ct);
+  *result_ptr = result;
+  return (!result) || (remainder && (S_CAST(uint32_t, S_CAST(const unsigned char*, bitarr)[byte_ct - 1]) >> remainder));
+}
 
 
 // TransposeNypblock(), which is more plink-specific, is in pgenlib_misc

@@ -1,5 +1,5 @@
 // This library is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This library is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by the
@@ -729,6 +729,7 @@ uint32_t CopyAndDedupSortedStrptrsToStrbox(const char* const* sorted_strptrs, ui
       memcpy(&(strbox[write_idx * max_str_blen]), cur_str, cur_slen + 1);
       ++write_idx;
       prev_str = cur_str;
+      prev_slen = cur_slen;
     }
   } while (sorted_strptrs_iter != sorted_strptrs_end);
   return write_idx;

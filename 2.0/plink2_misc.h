@@ -2,7 +2,7 @@
 #define __PLINK2_MISC_H__
 
 // This file is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This program is free software: you can redistribute it and/or modify it
 // under the terms of the GNU General Public License as published by the Free
@@ -21,10 +21,45 @@
 #include "include/pgenlib_read.h"
 #include "include/plink2_base.h"
 #include "plink2_common.h"
+#include "plink2_random.h"
 
 #ifdef __cplusplus
 namespace plink2 {
 #endif
+
+PglErr MakePermPheno(const uintptr_t* sample_include, const SampleIdInfo* siip, const PhenoCol* pheno_cols, const char* pheno_names, const char* pheno_name, const char* output_missing_pheno, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t pheno_ct, uintptr_t max_pheno_name_blen, uint32_t perm_ct, uint32_t output_zst, uint32_t max_thread_ct, sfmt_t* sfmtp, char* outname, char* outname_end);
+PglErr WriteVarRanges(const uintptr_t* variant_include, const char* const* variant_ids, uint32_t block_ct, uint32_t variant_ct, uint32_t allow_dups, uint32_t max_variant_id_slen, uint32_t max_thread_ct, char* outname, char* outname_end);
+
+FLAGSET_DEF_START()
+  kfInfoCols0,
+  kfInfoColsZs = (1 << 0),
+  kfInfoColsAll = (1 << 1),
+  // set when nothing else needs the variant file loaded, so it can be scanned
+  // directly
+  kfInfoColsStream = (1 << 2),
+
+  kfInfoColsColChrom = (1 << 3),
+  kfInfoColsColPos = (1 << 4),
+  kfInfoColsColRef = (1 << 5),
+  kfInfoColsColAlt = (1 << 6),
+  kfInfoColsColDefault = (kfInfoColsColChrom | kfInfoColsColPos | kfInfoColsColRef | kfInfoColsColAlt),
+  kfInfoColsColAll = ((kfInfoColsColAlt * 2) - kfInfoColsColChrom)
+FLAGSET_DEF_END(InfoColsFlags);
+
+typedef struct InfoColsInfoStruct {
+  NONCOPYABLE(InfoColsInfoStruct);
+  // \0-separated, \0\0-terminated; null when 'all' was given.
+  char* keys_flattened;
+  InfoColsFlags flags;
+} InfoColsInfo;
+
+void InitInfoCols(InfoColsInfo* icip);
+
+void CleanupInfoCols(InfoColsInfo* icip);
+
+PglErr InfoToColsStream(const char* pvarname, const InfoColsInfo* icip, MiscFlags misc_flags, char input_missing_geno_char, uint32_t max_thread_ct, ChrInfo* cip, char* outname, char* outname_end);
+
+PglErr InfoToCols(const uintptr_t* variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const char* pvar_info_reload, const char* xheader, const InfoColsInfo* icip, uintptr_t xheader_blen, uint32_t variant_ct, uint32_t max_thread_ct, char* outname, char* outname_end);
 
 FLAGSET_DEF_START()
   kfRecoverVarIds0,
@@ -55,7 +90,8 @@ FLAGSET_DEF_START()
   kfPhenoTransformVstdAll = (1 << 5),
   kfPhenoTransformQuantnormPheno = (1 << 6),
   kfPhenoTransformQuantnormCovar = (1 << 7),
-  kfPhenoTransformQuantnormAll = (1 << 8)
+  kfPhenoTransformQuantnormAll = (1 << 8),
+  kfPhenoTransformTailPheno = (1 << 9)
 FLAGSET_DEF_END(PhenoTransformFlags);
 
 FLAGSET_DEF_START()
@@ -132,7 +168,7 @@ FLAGSET_DEF_START()
   kfMissingRptScolFmiss = (1 << 15),
   kfMissingRptScolFmissHh = (1 << 16),
   kfMissingRptScolDefault = (kfMissingRptScolMaybefid | kfMissingRptScolMaybesid | kfMissingRptScolMissphenos | kfMissingRptScolNmiss | kfMissingRptScolNobs | kfMissingRptScolFmiss),
-  kfMissingRptScolAll = ((kfMissingRptScolFmissHh * 2) - kfMissingRptScolMaybesid),
+  kfMissingRptScolAll = ((kfMissingRptScolFmissHh * 2) - kfMissingRptScolMaybefid),
 
   kfMissingRptVcolChrom = (1 << 17),
   kfMissingRptVcolPos = (1 << 18),
@@ -222,9 +258,60 @@ FLAGSET_DEF_START()
   kfHetColHet = (1 << 8),
   kfHetColNobs = (1 << 9),
   kfHetColF = (1 << 10),
+  // GCTA's three inbreeding-coefficient estimators, generalized to
+  // multiallelic variants.  PLINK 1.x reported these from a separate --ibc
+  // command.
+  kfHetColFhat1 = (1 << 11),
+  kfHetColFhat2 = (1 << 12),
+  kfHetColFhat3 = (1 << 13),
+  kfHetColIbcMask = (kfHetColFhat1 | kfHetColFhat2 | kfHetColFhat3),
   kfHetColDefault = (kfHetColMaybefid | kfHetColMaybesid | kfHetColHom | kfHetColNobs | kfHetColF),
-  kfHetColAll = ((kfHetColF * 2) - kfHetColMaybefid)
+  kfHetColAll = ((kfHetColFhat3 * 2) - kfHetColMaybefid)
 FLAGSET_DEF_END(HetFlags);
+
+FLAGSET_DEF_START()
+  kfHomozyg0,
+  kfHomozygOldLengths = (1 << 0),
+  kfHomozygZs = (1 << 1),
+
+  kfHomozygColMaybefid = (1 << 2),
+  kfHomozygColFid = (1 << 3),
+  kfHomozygColMaybesid = (1 << 4),
+  kfHomozygColSid = (1 << 5),
+  kfHomozygColMaybepheno = (1 << 6),
+  kfHomozygColPheno = (1 << 7),
+  kfHomozygColChrom = (1 << 8),
+  kfHomozygColPos = (1 << 9),
+  kfHomozygColKb = (1 << 10),
+  kfHomozygColNsnp = (1 << 11),
+  kfHomozygColDensity = (1 << 12),
+  kfHomozygColPhom = (1 << 13),
+  kfHomozygColPhet = (1 << 14),
+  kfHomozygColNseg = (1 << 15),
+  kfHomozygColKbtot = (1 << 16),
+  kfHomozygColKbavg = (1 << 17),
+  kfHomozygColFroh = (1 << 18),
+  kfHomozygColMaybeRohCt = (1 << 19),
+  kfHomozygColRohCt = (1 << 20),
+  kfHomozygColStratRohCt = (1 << 21),
+  kfHomozygColDefault = (kfHomozygColMaybefid | kfHomozygColMaybesid | kfHomozygColMaybepheno | kfHomozygColChrom | kfHomozygColPos | kfHomozygColKb | kfHomozygColNsnp | kfHomozygColDensity | kfHomozygColPhom | kfHomozygColPhet | kfHomozygColNseg | kfHomozygColKbtot | kfHomozygColKbavg | kfHomozygColFroh | kfHomozygColMaybeRohCt | kfHomozygColStratRohCt),
+  kfHomozygColAll = ((kfHomozygColStratRohCt * 2) - kfHomozygColMaybefid)
+FLAGSET_DEF_END(HomozygFlags);
+
+typedef struct HomozygInfoStruct {
+  char* pheno_name;
+  HomozygFlags flags;
+  uint32_t min_snp;
+  uint32_t min_bases;
+  double min_af;
+  double max_bases_per_snp;
+  uint32_t max_hets;
+  uint32_t max_gap;
+  uint32_t window_size;
+  uint32_t window_max_hets;
+  uint32_t window_max_missing;
+  double hit_threshold;
+} HomozygInfo;
 
 typedef struct UpdateAllelesStruct {
   NONCOPYABLE(UpdateAllelesStruct);
@@ -420,15 +507,25 @@ void CleanupFst(FstInfo* fst_info_ptr);
 
 void InitCheckSex(CheckSexInfo* check_sex_info_ptr);
 
+void InitHomozyg(HomozygInfo* homozyg_info_ptr);
+
+void CleanupHomozyg(HomozygInfo* homozyg_info_ptr);
+
 PglErr FlipAlleles(const uintptr_t* variant_include, const char* const* variant_ids, const uint32_t* variant_id_htable, const uint32_t* htable_dup_base, const uintptr_t* allele_idx_offsets, const FlipInfo* flip_info_ptr, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_variant_id_slen, uintptr_t variant_id_htable_size, uint32_t max_thread_ct, char** allele_storage_mutable);
 
 PglErr UpdateVarBps(const ChrInfo* cip, const char* const* variant_ids, const uint32_t* variant_id_htable, const uint32_t* htable_dup_base, const TwoColParams* params, uint32_t sort_vars_in_cmd, uint32_t raw_variant_ct, uint32_t max_variant_id_slen, uint32_t htable_size, uint32_t max_thread_ct, uintptr_t* variant_include, uint32_t* __restrict variant_bps, uint32_t* __restrict variant_ct_ptr, UnsortedVar* vpos_sortstatusp);
+
+PglErr ApplyCmMap(const char* cm_map_fname, const char* cm_map_chrname, const uintptr_t* variant_include, const ChrInfo* cip, const uint32_t* variant_bps, uint32_t raw_variant_ct, uint32_t max_thread_ct, double* variant_cms);
+
+PglErr UpdateVarCms(const char* const* variant_ids, const uint32_t* variant_id_htable, const uint32_t* htable_dup_base, const uintptr_t* variant_include, const TwoColParams* params, uint32_t raw_variant_ct, uint32_t max_variant_id_slen, uint32_t htable_size, uint32_t max_thread_ct, double* __restrict variant_cms);
 
 PglErr UpdateVarNames(const uintptr_t* variant_include, const uint32_t* variant_id_htable, const uint32_t* htable_dup_base, const TwoColParams* params, uint32_t raw_variant_ct, uint32_t htable_size, uint32_t max_thread_ct, char** variant_ids, uint32_t* max_variant_id_slen_ptr);
 
 PglErr UpdateVarAlleles(const uintptr_t* variant_include, const char* const* variant_ids, const uint32_t* variant_id_htable, const uint32_t* htable_dup_base, const uintptr_t* allele_idx_offsets, const UpdateAllelesInfo* update_alleles_info_ptr, uint32_t raw_variant_ct, uint32_t max_variant_id_slen, uint32_t htable_size, uint32_t max_allele_ct, char input_missing_geno_char, uint32_t max_thread_ct, char** allele_storage_mutable, uint32_t* max_allele_slen_ptr, char* outname, char* outname_end);
 
 PglErr RecoverVarIds(const char* fname, const uintptr_t* variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const char* missing_varid, uint32_t raw_variant_ct, uint32_t variant_ct, RecoverVarIdsFlags flags, uint32_t max_thread_ct, char** variant_ids, uint32_t* max_variant_id_slen_ptr, char* outname, char* outname_end);
+
+PglErr MakePheno(const char* fname, const char* val_str, const uintptr_t* sample_include, const SampleIdInfo* siip, uint32_t raw_sample_ct, uint32_t sample_ct, PhenoCol** pheno_cols_ptr, char** pheno_names_ptr, uint32_t* pheno_ct_ptr, uintptr_t* max_pheno_name_blen_ptr);
 
 PglErr Plink1ClusterImport(const char* within_fname, const char* catpheno_name, const char* family_missing_catname, const uintptr_t* sample_include, const char* sample_ids, const char* missing_catname, uint32_t raw_sample_ct, uint32_t sample_ct, uintptr_t max_sample_id_blen, uint32_t mwithin_val, uint32_t max_thread_ct, PhenoCol** pheno_cols_ptr, char** pheno_names_ptr, uint32_t* pheno_ct_ptr, uintptr_t* max_pheno_name_blen_ptr);
 
@@ -446,6 +543,8 @@ PglErr UpdateSampleParents(const char* fname, const SampleIdInfo* siip, const ui
 PglErr UpdateSampleSexes(const uintptr_t* sample_include, const SampleIdInfo* siip, const UpdateSexInfo* update_sex_info_ptr, uint32_t raw_sample_ct, uintptr_t sample_ct, uint32_t max_thread_ct, uintptr_t* sex_nm, uintptr_t* sex_male);
 
 PglErr SplitCatPheno(const char* split_cat_phenonames_flattened, const uintptr_t* sample_include, uint32_t raw_sample_ct, PhenoTransformFlags pheno_transform_flags, PhenoCol** pheno_cols_ptr, char** pheno_names_ptr, uint32_t* pheno_ct_ptr, uintptr_t* max_pheno_name_blen_ptr, PhenoCol** covar_cols_ptr, char** covar_names_ptr, uint32_t* covar_ct_ptr, uintptr_t* max_covar_name_blen_ptr);
+
+PglErr PhenoTailDowncode(double tail_lt, double tail_hbt, uint32_t raw_sample_ct, uint32_t pheno_ct, PhenoCol* pheno_cols);
 
 PglErr PhenoVarianceStandardize(const char* vstd_flattened, const uintptr_t* sample_include, const char* pheno_names, uint32_t raw_sample_ct, uint32_t pheno_ct, uintptr_t max_pheno_name_blen, uint32_t is_covar, uint32_t is_covar_flag, PhenoCol* pheno_cols);
 
@@ -469,9 +568,39 @@ PglErr Sdiff(const uintptr_t* orig_sample_include, const SampleIdInfo* siip, con
 
 PglErr WriteSnplist(const uintptr_t* variant_include, const char* const* variant_ids, uint32_t variant_ct, uint32_t output_zst, uint32_t allow_dups, uint32_t max_thread_ct, char* outname, char* outname_end);
 
+PglErr List23Indels(const uintptr_t* variant_include, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, uint32_t variant_ct, uint32_t output_zst, uint32_t allow_dups, uint32_t max_thread_ct, char* outname, char* outname_end);
+
 PglErr WriteCovar(const uintptr_t* sample_include, const PedigreeIdInfo* piip, const uintptr_t* sex_nm, const uintptr_t* sex_male, const PhenoCol* pheno_cols, const char* pheno_names, const PhenoCol* covar_cols, const char* covar_names, const uint32_t* new_sample_idx_to_old, const char* output_missing_pheno, uint32_t sample_ct, uint32_t pheno_ct, uintptr_t max_pheno_name_blen, uint32_t covar_ct, uintptr_t max_covar_name_blen, WriteCovarFlags write_covar_flags, char* outname, char* outname_end);
 
+FLAGSET_DEF_START()
+  kfTestMissing0,
+  kfTestMissingMidp = (1 << 0),
+  kfTestMissingZs = (1 << 1),
+  kfTestMissingDosage = (1 << 2),
+
+  kfTestMissingColChrom = (1 << 3),
+  kfTestMissingColPos = (1 << 4),
+  kfTestMissingColRef = (1 << 5),
+  kfTestMissingColAlt1 = (1 << 6),
+  kfTestMissingColAlt = (1 << 7),
+  kfTestMissingColMaybeprovref = (1 << 8),
+  kfTestMissingColProvref = (1 << 9),
+  kfTestMissingColNmissa = (1 << 10),
+  kfTestMissingColNobsa = (1 << 11),
+  kfTestMissingColFmissa = (1 << 12),
+  kfTestMissingColNmissu = (1 << 13),
+  kfTestMissingColNobsu = (1 << 14),
+  kfTestMissingColFmissu = (1 << 15),
+  kfTestMissingColP = (1 << 16),
+  kfTestMissingColDefault = (kfTestMissingColChrom | kfTestMissingColPos | kfTestMissingColMaybeprovref | kfTestMissingColFmissa | kfTestMissingColFmissu | kfTestMissingColP),
+  kfTestMissingColAll = ((kfTestMissingColP * 2) - kfTestMissingColChrom)
+FLAGSET_DEF_END(TestMissingFlags);
+
+PglErr TestMissingReport(const uintptr_t* orig_sample_include, const uintptr_t* sex_male, const PhenoCol* pheno_cols, const char* pheno_names, const char* test_missing_pheno_name, const uintptr_t* variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const uintptr_t* nonref_flags, uint32_t raw_sample_ct, uint32_t pheno_ct, uintptr_t max_pheno_name_blen, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_allele_slen, PgenGlobalFlags gflags, TestMissingFlags flags, PgenReader* simple_pgrp, char* outname, char* outname_end);
+
 PglErr HetReport(const uintptr_t* sample_include, const SampleIdInfo* siip, const uintptr_t* orig_variant_include, const ChrInfo* cip, const uintptr_t* allele_idx_offsets, const double* allele_freqs, const uintptr_t* founder_info, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t founder_ct, uint32_t raw_variant_ct, uint32_t orig_variant_ct, uint32_t max_allele_ct, HetFlags flags, uint32_t max_thread_ct, uintptr_t pgr_alloc_cacheline_ct, PgenFileInfo* pgfip, char* outname, char* outname_end);
+
+PglErr HomozygReport(const uintptr_t* sample_include, const SampleIdInfo* siip, const uintptr_t* sex_male, const PhenoCol* pheno_cols, const char* pheno_names, const uintptr_t* orig_variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const double* allele_freqs, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t pheno_ct, uintptr_t max_pheno_name_blen, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_allele_ct, const HomozygInfo* hip, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
 
 PglErr CheckOrImputeSex(const uintptr_t* sample_include, const SampleIdInfo* siip, const uintptr_t* orig_variant_include, const ChrInfo* cip, const uintptr_t* allele_idx_offsets, const double* allele_freqs, const CheckSexInfo* csip, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t raw_variant_ct, uint32_t max_allele_ct, uint32_t max_thread_ct, uintptr_t pgr_alloc_cacheline_ct, uintptr_t* sex_nm, uintptr_t* sex_male, PgenFileInfo* pgfip, char* outname, char* outname_end);
 

@@ -417,7 +417,7 @@ void fill_subset_weights(double* subset_weights, double* main_weights) {
 #endif
 }
 
-void fill_subset_weights_r(double* subset_weights, double* set_allele_freqs, double* main_weights, uint32_t var_std) {
+void fill_subset_weights_r(double* subset_weights, double* set_allele_freqs, double* main_weights, uint32_t* infinite_variance_present_ptr, uint32_t var_std) {
   uint32_t uii;
   uint32_t ujj;
   uint32_t ukk;
@@ -488,6 +488,7 @@ void fill_subset_weights_r(double* subset_weights, double* set_allele_freqs, dou
 	wtarr[uii * 8 + 6] = mean * mean * mult;
       }
     } else {
+      *infinite_variance_present_ptr = 1;
       if (set_allele_freqs[uii] == 0.0) {
         wtarr[uii * 8] = 0;
         wtarr[uii * 8 + 1] = 0;
@@ -763,7 +764,6 @@ static double* g_ibs_test_partial_sums;
 static double* g_perm_results;
 static uintptr_t g_perm_ct;
 static double g_half_marker_ct_recip;
-static uint32_t g_load_dists;
 static unsigned char* g_generic_buf;
 
 void ibs_test_init_col_buf(uintptr_t row_idx, uintptr_t perm_ct, uintptr_t* perm_rows, uintptr_t* perm_col_buf) {
@@ -788,7 +788,7 @@ void ibs_test_init_col_buf(uintptr_t row_idx, uintptr_t perm_ct, uintptr_t* perm
   } while (perm_idx < perm_ct);
 }
 
-double fill_psbuf(uintptr_t block_size, double half_marker_ct_recip, uint32_t load_dists, uintptr_t* pheno_nm, uintptr_t* pheno_c, double* dists, uintptr_t* col_uidxp, double* psbuf, double* ssq0p) {
+double fill_psbuf(uintptr_t block_size, double half_marker_ct_recip, uintptr_t* pheno_nm, uintptr_t* pheno_c, double* dists, uintptr_t* col_uidxp, double* psbuf, double* ssq0p) {
   // also updates total sum and sums of squares
   double tot = 0.0;
   uintptr_t col_idx = 0;
@@ -810,11 +810,7 @@ double fill_psbuf(uintptr_t block_size, double half_marker_ct_recip, uint32_t lo
     subtot = 0.0;
     do {
       next_set_ul_unsafe_ck(pheno_nm, &col_uidx);
-      if (load_dists) {
-	dxx = dists[col_uidx];
-      } else {
-	dxx = 1.0 - dists[col_uidx] * half_marker_ct_recip;
-      }
+      dxx = 1.0 - dists[col_uidx] * half_marker_ct_recip;
       increment[sub_block_idx] = subtot - dxx;
       subtot += dxx;
       ssq[IS_SET(pheno_c, col_uidx)] += dxx * dxx;
@@ -912,7 +908,6 @@ void ibs_test_range(uint32_t tidx, uintptr_t* perm_col_buf, double* perm_results
   uintptr_t* perm_rows = g_perm_rows;
   double* dists = g_dists;
   double half_marker_ct_recip = g_half_marker_ct_recip;
-  uint32_t load_dists = g_load_dists;
   double ssq[3];
   double* dptr;
   double block_tot;
@@ -941,7 +936,7 @@ void ibs_test_range(uint32_t tidx, uintptr_t* perm_col_buf, double* perm_results
       } else {
 	block_size = BITCT;
       }
-      block_tot = fill_psbuf(block_size, half_marker_ct_recip, load_dists, pheno_nm, pheno_c, dptr, &col_uidx, psptr, &(ssq[row_set]));
+      block_tot = fill_psbuf(block_size, half_marker_ct_recip, pheno_nm, pheno_c, dptr, &col_uidx, psptr, &(ssq[row_set]));
       dist_tot += block_tot;
       ibs_test_process_perms(&(perm_rows[(col_idx / BITCT) * perm_ct]), perm_ct, (block_size + 7) / 8, block_tot, psptr, perm_col_buf, perm_results);
       col_idx += block_size;
@@ -1611,7 +1606,6 @@ THREAD_RET_TYPE calc_wdist_thread(void* arg) {
   uintptr_t* masks_ptr = g_masks;
   uintptr_t* mmasks_ptr = g_mmasks;
   double* subset_weights_ptr = g_subset_weights;
-  uint32_t* subset_weights_i_ptr = g_subset_weights_i;
   uint32_t* weighted_missing_ptr = &(g_missing_tot_weights[offset]);
   uint32_t end_idx = g_thread_start[tidx + 1];
   uint32_t is_last_block;
@@ -1619,8 +1613,7 @@ THREAD_RET_TYPE calc_wdist_thread(void* arg) {
     is_last_block = g_is_last_thread_block;
     incr_dists(dists_ptr, geno_ptr, masks_ptr, subset_weights_ptr, ulii, end_idx);
     if (is_last_block || (g_thread_spawn_ct & 1)) {
-      // subset_weights_i is stationary here
-      incr_wt_dist_missing(weighted_missing_ptr, subset_weights_i_ptr, mmasks_ptr, ulii, end_idx);
+      incr_wt_dist_missing(weighted_missing_ptr, g_subset_weights_i, mmasks_ptr, ulii, end_idx);
     }
     if ((!tidx) || is_last_block) {
       THREAD_RETURN;
@@ -2694,9 +2687,10 @@ int32_t unrelated_herit_batch(uint32_t load_grm_bin, char* grmname, char* phenon
 }
 #endif
 
-int32_t ibs_test_calc(pthread_t* threads, char* read_dists_fname, uintptr_t unfiltered_sample_ct, uintptr_t* sample_exclude, uintptr_t sample_ct, uintptr_t perm_ct, uintptr_t pheno_nm_ct, uintptr_t pheno_ctrl_ct, uintptr_t* pheno_nm, uintptr_t* pheno_c) {
-  // g_dists and g_half_marker_ct_recip assumed to be populated by
-  // calc_distance().
+int32_t ibs_test_calc(pthread_t* threads, char* read_dists_fname, uintptr_t marker_ct, uintptr_t unfiltered_sample_ct, uintptr_t* sample_exclude, uintptr_t sample_ct, uintptr_t perm_ct, uintptr_t pheno_nm_ct, uintptr_t pheno_ctrl_ct, uintptr_t* pheno_nm, uintptr_t* pheno_c) {
+  // g_dists is populated either by calc_distance() or by --read-dists, and
+  // holds distances in both cases; g_half_marker_ct_recip turns one into an
+  // IBS value, and calc_distance() only sets it when it runs.
   unsigned char* bigstack_mark = g_bigstack_base;
   uintptr_t unfiltered_sample_ctl = BITCT_TO_WORDCT(unfiltered_sample_ct);
   uintptr_t pheno_nm_ctl = BITCT_TO_WORDCT(pheno_nm_ct);
@@ -2746,7 +2740,13 @@ int32_t ibs_test_calc(pthread_t* threads, char* read_dists_fname, uintptr_t unfi
   double* rptr2;
 #endif
   uintptr_t perm_idx;
-  g_load_dists = read_dists_fname? 1 : 0;
+  if (read_dists_fname) {
+    // --read-dists skipped calc_distance(), so the scale factor it would have
+    // computed has to be set here.  A matrix written by --distance on this
+    // same dataset then gives exactly the same report as recalculating, which
+    // is what --read-dists promises.
+    g_half_marker_ct_recip = 0.5 / ((double)((intptr_t)marker_ct));
+  }
   g_sample_ct = sample_ct;
   perm_ct += 1; // first permutation = original config
   if (pheno_ctrl_ct < 2) {
@@ -3755,7 +3755,6 @@ uint32_t distance_d_write_1mibs_sq_emitn(uint32_t overflow_ct, unsigned char* re
 
 int32_t distance_d_write(FILE** outfile_ptr, FILE** outfile2_ptr, FILE** outfile3_ptr, int32_t dist_calc_type, char* outname, char* outname_end, double* dists, double half_marker_ct_recip, uint32_t sample_ct, int32_t first_sample_idx, int32_t end_sample_idx, int32_t parallel_idx, int32_t parallel_tot, unsigned char* membuf) {
   // membuf assumed to be of at least size sample_ct * 8.
-  printf("distance_d_write\n");
   uint32_t bin4 = dist_calc_type & DISTANCE_BIN4;
   int32_t shape = dist_calc_type & DISTANCE_SHAPEMASK;
   int32_t write_alcts = dist_calc_type & DISTANCE_ALCT;
@@ -3829,6 +3828,7 @@ int32_t distance_d_write(FILE** outfile_ptr, FILE** outfile2_ptr, FILE** outfile
 	  fflush(stdout);
 	} while (g_pct <= 100);
 	distance_print_done(1, outname, outname_end);
+	g_pct = 1;
       }
       if (write_1mibs_matrix) {
 	dist_ptr = dists;
@@ -3904,15 +3904,16 @@ int32_t distance_d_write(FILE** outfile_ptr, FILE** outfile2_ptr, FILE** outfile
 	      goto distance_d_write_ret_WRITE_FAIL;
 	    }
 	  }
+	  // IBS of a sample with itself is 1, in square0 as in square
+	  if (fwrite_checked(&dyy, sizeof(double), *outfile2_ptr)) {
+	    goto distance_d_write_ret_WRITE_FAIL;
+	  }
 	  if (shape == DISTANCE_SQ0) {
-	    if (fwrite_checked(membuf, (sample_ct - ii) * sizeof(double), *outfile2_ptr)) {
+	    if (fwrite_checked(membuf, (sample_ct - ii - 1) * sizeof(double), *outfile2_ptr)) {
 	      goto distance_d_write_ret_WRITE_FAIL;
 	    }
 	  } else {
 	    // square matrix
-	    if (fwrite_checked(&dyy, sizeof(double), *outfile2_ptr)) {
-	      goto distance_d_write_ret_WRITE_FAIL;
-	    }
 	    for (ulii = ii + 1; ulii < sample_ct; ulii++) {
 	      dxx = 1.0 - dists[(ulii * (ulii - 1)) / 2 + ii] * half_marker_ct_recip;
 	      if (fwrite_checked(&dxx, sizeof(double), *outfile2_ptr)) {
@@ -3978,8 +3979,9 @@ int32_t distance_d_write(FILE** outfile_ptr, FILE** outfile2_ptr, FILE** outfile
 	dist_ptr = dists;
 	for (ii = first_sample_idx; ii < end_sample_idx; ii++) {
 	  for (uii = 0; uii < (uint32_t)ii; uii++) {
-	    fxx = (float)dist_ptr[uii];
-	    fwrite(&fxx, 4, 1, *outfile_ptr);
+            // bugfix (7 Sep 2026): this previously clobbered fxx
+	    fyy = (float)dist_ptr[uii];
+	    fwrite(&fyy, 4, 1, *outfile_ptr);
 	  }
 	  dist_ptr = &(dist_ptr[(uint32_t)ii]);
 	  if (shape == DISTANCE_SQ0) {
@@ -4018,15 +4020,15 @@ int32_t distance_d_write(FILE** outfile_ptr, FILE** outfile2_ptr, FILE** outfile
 	      goto distance_d_write_ret_WRITE_FAIL;
 	    }
 	  }
+	  if (fwrite_checked(&fyy, sizeof(float), *outfile2_ptr)) {
+	    goto distance_d_write_ret_WRITE_FAIL;
+	  }
 	  if (shape == DISTANCE_SQ0) {
-	    if (fwrite_checked(membuf, (sample_ct - ii) * sizeof(float), *outfile2_ptr)) {
+	    if (fwrite_checked(membuf, (sample_ct - ii - 1) * sizeof(float), *outfile2_ptr)) {
 	      goto distance_d_write_ret_WRITE_FAIL;
 	    }
 	  } else {
 	    // square matrix
-	    if (fwrite_checked(&fyy, sizeof(float), *outfile2_ptr)) {
-	      goto distance_d_write_ret_WRITE_FAIL;
-	    }
 	    for (ulii = ii + 1; ulii < sample_ct; ulii++) {
 	      fxx = (float)(1.0 - dists[(ulii * (ulii - 1)) / 2 + ii] * half_marker_ct_recip);
 	      fwrite(&fxx, 4, 1, *outfile2_ptr);
@@ -5373,7 +5375,7 @@ uint32_t rel_cutoff_batch_rbin_emitn(uint32_t overflow_ct, unsigned char* readbu
 	}
 	sptr_cur = memcpya(sptr_cur, wbuf, wbuf_ct);
 	sptr_cur = uint32toa_x(++new_col, '\t', sptr_cur);
-	if ((fread(&fxx, sizeof(float), 1, in_bin_nfile) != sizeof(float)) || (fread(&fyy, sizeof(float), 1, in_binfile) != sizeof(float))) {
+	if ((fread(&fxx, sizeof(float), 1, in_bin_nfile) != 1) || (fread(&fyy, sizeof(float), 1, in_binfile) != 1)) {
 	  // can't use return code here
 	  putc_unlocked('\n', stdout);
 	  fflush(stdout);
@@ -5897,13 +5899,13 @@ int32_t rel_cutoff_batch(uint32_t load_grm_bin, char* grmname, char* outname, ch
 		    break;
 		  }
 		}
-		fseeko(in_bin_nfile, (col - uii) * sizeof(float), SEEK_CUR);
+		fseeko(in_binfile, (col - uii) * sizeof(float), SEEK_CUR);
 		fseeko(in_bin_nfile, (col - uii) * sizeof(float), SEEK_CUR);
 		if (col > row) {
 		  break;
 		}
 	      }
-	      if ((fread(&fxx, sizeof(float), 1, in_bin_nfile) != sizeof(float)) || (fread(&fyy, sizeof(float), 1, in_binfile) != sizeof(float))) {
+	      if ((fread(&fxx, sizeof(float), 1, in_bin_nfile) != 1) || (fread(&fyy, sizeof(float), 1, in_binfile) != 1)) {
 		goto rel_cutoff_batch_ret_READ_FAIL;
 	      }
 	      fwrite(&fxx, 4, 1, out_bin_nfile);
@@ -6315,7 +6317,21 @@ int32_t load_distance_wts(char* distance_wts_fname, uintptr_t unfiltered_marker_
     goto load_distance_wts_ret_READ_FAIL;
   }
   bigstack_reset(bigstack_mark);
-  marker_ct = popcount_longs(marker_include, unfiltered_marker_ctl) - zcount;
+  // bugfix (10 Sep 2026): weight-0 variants were left in marker_include while
+  // being subtracted from marker_ct, so the caller iterated over marker_ct
+  // included variants and read main_weights[] in order.  Every weight past the
+  // first zero was then applied to the wrong variant, and the last zcount
+  // included variants were dropped from the calculation instead of the
+  // weight-0 ones.  They have to leave marker_include too; they are only in it
+  // so that a repeated ID is still caught above.
+  if (zcount) {
+    for (marker_uidx = 0; marker_uidx < unfiltered_marker_ct; marker_uidx++) {
+      if (is_set(marker_include, marker_uidx) && (main_weights_tmp[marker_uidx] == 0.0)) {
+        clear_bit(marker_uidx, marker_include);
+      }
+    }
+  }
+  marker_ct = popcount_longs(marker_include, unfiltered_marker_ctl);
   if (!marker_ct) {
     logerrprint("Error: No valid nonzero entries in --distance-wts file.\n");
     goto load_distance_wts_ret_INVALID_FORMAT;
@@ -6334,13 +6350,9 @@ int32_t load_distance_wts(char* distance_wts_fname, uintptr_t unfiltered_marker_
   }
   dptr = *main_weights_ptr;
   *marker_ct_ptr = marker_ct;
-  for (marker_uidx = 0, marker_idx = 0; marker_idx < marker_ct; marker_uidx++) {
+  for (marker_uidx = 0, marker_idx = 0; marker_idx < marker_ct; marker_uidx++, marker_idx++) {
     next_set_unsafe_ck(marker_include, &marker_uidx);
-    dxx = main_weights_tmp[marker_uidx];
-    if (dxx != 0.0) {
-      *dptr++ = dxx;
-      marker_idx++;
-    }
+    *dptr++ = main_weights_tmp[marker_uidx];
   }
   while (0) {
   load_distance_wts_ret_NOMEM:
@@ -6381,6 +6393,7 @@ int32_t calc_rel(pthread_t* threads, uint32_t parallel_idx, uint32_t parallel_to
   uint32_t dist_thread_ct = g_thread_ct;
   uint32_t rel_req = relationship_req(calculation_type);
   uint32_t all_missing_warning = 0;
+  uint32_t infinite_variance_warning = 0;
   int64_t llxx = 0;
   double rel_cutoff = relip->cutoff;
   double* dist_ptr = nullptr;
@@ -6574,7 +6587,7 @@ int32_t calc_rel(pthread_t* threads, uint32_t parallel_idx, uint32_t parallel_to
 	update_rel_ibc(rel_ibc, geno, &(set_allele_freq_buf[win_marker_idx]), main_weights_ptr? (&(main_weights_ptr[win_marker_idx])) : nullptr, ibc_type, sample_ct, ukk);
       }
       if (rel_req) {
-	fill_subset_weights_r(subset_weights, &(set_allele_freq_buf[win_marker_idx]), main_weights_ptr? (&(main_weights_ptr[win_marker_idx])) : nullptr, (ibc_type != -1));
+	fill_subset_weights_r(subset_weights, &(set_allele_freq_buf[win_marker_idx]), main_weights_ptr? (&(main_weights_ptr[win_marker_idx])) : nullptr, &infinite_variance_warning, (ibc_type != -1));
 	ulii = 0;
 	if (!main_weights_ptr) {
 	  if (spawn_threads2(threads, &calc_rel_thread, dist_thread_ct, ujj)) {
@@ -6599,6 +6612,9 @@ int32_t calc_rel(pthread_t* threads, uint32_t parallel_idx, uint32_t parallel_to
     dist_ptr = rel_dists;
   } else {
     putc_unlocked('\n', stdout);
+  }
+  if (infinite_variance_warning) {
+    logerrprint("Warning: Monomorphic variant(s) present; this implies GRM-destabilizing very\nrare variants are also present.  You should almost certainly apply a MAF filter\nand rerun this calculation, instead of using results from the current run.\n");
   }
   dptr2 = rel_ibc;
   if (calculation_type & CALC_IBC) {
@@ -7235,7 +7251,22 @@ int32_t calc_pca(FILE* bedfile, uintptr_t bed_offset, char* outname, char* outna
 	  // matrix, and D is a diagonal eigenvalue matrix.
 	  fill_double_zero(pc_ct, cur_var_wts);
 	  dxx = set_allele_freqs[marker_uidx];
-	  dyy = sqrt(1 / (2 * dxx * (1.0 - dxx)));
+	  if ((dxx != 0.0) && (dxx < (1.0 - EPSILON))) {
+	    dyy = sqrt(1 / (2 * dxx * (1.0 - dxx)));
+	  } else {
+            // update (23 Sep 2026): GRM construction should never have
+            // tolerated monomorphic variants, since if they're present, it's
+            // practically certain that very-low-MAF variants which destabilize
+            // the GRM are also present.
+            // Unfortunately, changing regular GRM construction to error out
+            // would be out of line with compatibility expectations for 1.9.
+            // However, since the PCA-projection workflow supported by this
+            // variant-weight calculation was already broken by monomorphic
+            // variants, we are free to error out here.
+            logprint("\n");
+            logerrprint("Error: --pca: Monomorphic variant(s) present; this implies GRM-destabilizing\nvery rare variants are also present.  You should apply a MAF filter before\nretrying this calculation.\n");
+            goto calc_pca_ret_DEGENERATE_DATA;
+	  }
 	  ulptr = loadbuf;
 
 	  var_wt_incr[1] = dyy; // het
@@ -7744,7 +7775,10 @@ int32_t calc_distance(pthread_t* threads, uint32_t parallel_idx, uint32_t parall
       //     = 4 * maf * (1 - maf) * (maf * maf - maf + 1)
       //     constant factor doesn't matter here
       dxx = set_allele_freqs[marker_uidx];
-      if ((dxx != 0.0) && (dxx != 1.0)) {
+      if (dxx == 1.0) {
+        // bugfix (7 Sep 2026)
+        dxx = 0.0;
+      } else if (dxx != 0.0) {
 	dxx = dxx * (1.0 - dxx) * (dxx * dxx - dxx + 1);
 	if (main_weights) {
 	  dxx *= main_weights[marker_idx];
@@ -7758,6 +7792,14 @@ int32_t calc_distance(pthread_t* threads, uint32_t parallel_idx, uint32_t parall
     // performance becomes less important than accuracy on 50+ million marker
     // sets.)
     // subtract marker_ct to guard against rounding-driven overflow
+    if (!(dyy > 0.0)) {
+      // Every remaining variant is monomorphic, so every weight is zero.  The
+      // division below then gives infinity, and 0 * infinity is NaN, which the
+      // cast to uint32_t makes undefined.
+      logerrprint("Error: No variant has positive weight; --distance cannot be computed.\n");
+      retval = RET_DEGENERATE_DATA;
+      goto calc_distance_ret_1;
+    }
     dyy = (4294967296.0 - ((double)((intptr_t)marker_ct))) / dyy;
     for (marker_idx = 0; marker_idx < marker_ct; marker_idx++) {
       uii = (uint32_t)(dist_missing_wts[marker_idx] * dyy + 0.5);
@@ -7793,7 +7835,6 @@ int32_t calc_distance(pthread_t* threads, uint32_t parallel_idx, uint32_t parall
     if (bigstack_alloc_d(32768, &subset_weights)) {
       goto calc_distance_ret_NOMEM;
     }
-    g_subset_weights_i = wtbuf;
 #endif
     g_subset_weights = subset_weights;
   }
@@ -7954,7 +7995,8 @@ int32_t calc_distance(pthread_t* threads, uint32_t parallel_idx, uint32_t parall
       }
     } else {
       fill_ulong_zero(sample_ct, mmasks);
-      for (ukk = 0; ukk < ujj; ukk += MULTIPLEX_DIST_EXP / 2) {
+      uint32_t parity = 0;
+      for (ukk = 0; ukk < ujj; ukk += MULTIPLEX_DIST_EXP / 2, ++parity) {
 	glptr = geno;
 	glptr2 = masks;
 	glptr3 = mmasks;
@@ -7990,8 +8032,12 @@ int32_t calc_distance(pthread_t* threads, uint32_t parallel_idx, uint32_t parall
 	  }
 	}
 	fill_subset_weights(subset_weights, &(main_weights[marker_idx - ujj + ukk]));
-        g_subset_weights_i = &(wtbuf[ukk]);
-	uii = is_last_block && (ukk + (MULTIPLEX_DIST_EXP / 3) >= ujj);
+        // bugfix (13 Sep 2026): calc_wdist_thread() assumes this is advanced
+        // every other loop iteration
+        if (!parity) {
+          g_subset_weights_i = &(wtbuf[ukk]);
+        }
+	uii = is_last_block && (ukk + (MULTIPLEX_DIST_EXP / 2) >= ujj);
 	if (spawn_threads2(threads, &calc_wdist_thread, dist_thread_ct, uii)) {
 	  goto calc_distance_ret_THREAD_CREATE_FAIL;
 	}
@@ -8129,6 +8175,11 @@ int32_t calc_distance(pthread_t* threads, uint32_t parallel_idx, uint32_t parall
 	giptr2 = sample_missing;
 	uii = giptr2[sample_idx];
 	for (ujj = 0; ujj < sample_idx; ujj++) {
+          /*
+          if ((sample_idx == 3) && (ujj == 0)) {
+            printf("%g %u %u %u %u %u\n", marker_weight_sum_d, marker_weight_sum, uii, *giptr2, *giptr, *iptr);
+          }
+          */
 	  *dptr2++ = (marker_weight_sum_d / ((marker_weight_sum - uii - (*giptr2++)) + (*giptr++))) * (*iptr++);
 	}
       }
@@ -8137,6 +8188,11 @@ int32_t calc_distance(pthread_t* threads, uint32_t parallel_idx, uint32_t parall
 	giptr2 = sample_missing;
 	uii = giptr2[sample_idx];
 	for (ujj = 0; ujj < sample_idx; ujj++) {
+          /*
+          if ((sample_idx == 3) && (ujj == 0)) {
+            printf("%g %u %u %u %u %g\n", marker_weight_sum_d, marker_weight_sum, uii, *giptr2, *giptr, *dptr2);
+          }
+          */
 	  *dptr2 *= (marker_weight_sum_d / ((marker_weight_sum - uii - (*giptr2++)) + (*giptr++)));
 	  dptr2++;
 	}
@@ -8408,6 +8464,11 @@ int32_t calc_cluster_neighbor(pthread_t* threads, FILE* bedfile, uintptr_t bed_o
       goto calc_cluster_neighbor_ret_NOMEM;
     }
     fill_double_zero(ulii, neighbor_quantiles);
+    // The index array has to be cleared too.  update_neighbor() only writes an
+    // entry when a distance beats the current quantile, so a sample that never
+    // accumulates neighbor_n2 neighbors leaves entries at whatever malloc
+    // returned, and the report loop then uses them as sample indices.
+    fill_uint_zero(ulii, neighbor_qindices);
   }
   fill_ulong_zero(BITCT_TO_WORDCT(initial_triangle_size), cluster_merge_prevented);
   if ((min_ppc != 0.0) || genome_main || read_genome_fname) {
@@ -8607,7 +8668,10 @@ int32_t calc_cluster_neighbor(pthread_t* threads, FILE* bedfile, uintptr_t bed_o
       }
       for (ulii = 0; ulii < neighbor_row_ct; ulii++) {
         wptr = uint32toa_w6x(ulii + neighbor_n1, ' ', wptr_start);
-	sample_idx2 = sample_idx1 + ulii * sample_ct;
+	// neighbor_quantiles[] holds every rank from 1 up, so the row for
+	// rank (neighbor_n1 + ulii) is at that rank's offset, not at ulii.
+	// The mean/stdev loop above already indexes it that way.
+	sample_idx2 = sample_idx1 + (neighbor_n1 - 1 + ulii) * sample_ct;
         dxx = neighbor_quantiles[sample_idx2];
 	wptr = dtoa_g_wxp4x(dxx, 12, ' ', wptr);
         wptr = dtoa_g_wxp4x((dxx - neighbor_quantile_means[ulii]) * neighbor_quantile_stdev_recips[ulii], 12, ' ', wptr);

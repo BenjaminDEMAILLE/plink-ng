@@ -2,7 +2,7 @@
 #define __PGENLIB_FFI_SUPPORT_H__
 
 // This library is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This library is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by the
@@ -75,6 +75,28 @@ void Dosage16ToDoubles(const double* geno_double_pair_table, const uintptr_t* ge
 
 // If all samples are missing, this errors out.
 BoolErr Dosage16ToDoublesMeanimpute(const uintptr_t* genoarr, const uintptr_t* dosage_present, const uint16_t* dosage_main, uint32_t sample_ct, uint32_t dosage_ct, double* geno_double);
+
+// Phased (per-haplotype) dosages for a biallelic variant loaded with
+// PgrGetDp(), on a [0, 1] scale.  hap_dosages[2k] and hap_dosages[2k + 1] are
+// set to the first and second haplotype dosages of sample k, in the same
+// order as GenoarrMPToAlleleCodes() and plink2 --export vcf-dosage=HDS:
+// * explicit dosage + dosage-phase: stored values.
+// * explicit dosage, hardcall-phased het: the dosage is assigned so that the
+//   two haplotypes differ as much as possible, in the hardcall phase
+//   direction.
+// * explicit dosage, unphased: split evenly between the two haplotypes.
+// * hardcall only: 0/1 per haplotype when phased (homozygous calls are
+//   trivially phased), 0.5/0.5 for an unphased het.
+// * missing: -9 for both haplotypes.
+void PhasedDosage16ToFloatsMinus9(const PgenVariant* pgvp, uint32_t sample_ct, float* hap_dosages);
+
+void PhasedDosage16ToDoublesMinus9(const PgenVariant* pgvp, uint32_t sample_ct, double* hap_dosages);
+
+// Hardcall-only equivalent of the above for an arbitrary allele, given the
+// output of GenoarrMPToAlleleCodes() with non-null phasebytes.
+void AlleleCodesToHapDosageFloatsMinus9(const int32_t* allele_codes, const unsigned char* phasebytes, uint32_t sample_ct, int32_t allele_idx, float* hap_dosages);
+
+void AlleleCodesToHapDosageDoublesMinus9(const int32_t* allele_codes, const unsigned char* phasebytes, uint32_t sample_ct, int32_t allele_idx, double* hap_dosages);
 
 // Currently requires trailing bits of genoarr to be zeroed out.
 double LinearCombinationMeanimpute(const double* weights, const uintptr_t* genoarr, const uintptr_t* dosage_present, const uint16_t* dosage_main, uint32_t sample_ct, uint32_t dosage_ct);

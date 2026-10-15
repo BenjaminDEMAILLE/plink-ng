@@ -2,7 +2,7 @@
 #define __PLINK2_STATS_H__
 
 // This library is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This library is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by the
@@ -34,8 +34,8 @@ double ChisqToLnP(double chisq, uint32_t df);
 // only handles df=1 and 2 for now, plan to support 4 later
 // double PToChisq(double pval, uint32_t df);
 
-// only handles df=1 for now
-double LnPToChisq(double ln_pval);
+// handles df=1, 2, and 4 for now
+double LnPToChisq(double ln_pval, uint32_t df);
 
 // No -9 error return since that's a legitimate p-value logarithm.  Caller is
 // responsible for validating input.
@@ -52,6 +52,8 @@ HEADER_INLINE double ZscoreToP(double zz) {
 HEADER_INLINE double ZscoreToLnP(double zz) {
   return ChisqToLnP(zz * zz, 1);
 }
+
+double Fisher22TwoSidedP(int64_t obs_m11, int64_t obs_m12, int64_t obs_m21, int64_t obs_m22, int32_t midp, uint32_t logp);
 
 // HweP() has been replaced by HweLnP().  HweThresh() and HweThreshMidp() have
 // been replaced by HweThreshLn().

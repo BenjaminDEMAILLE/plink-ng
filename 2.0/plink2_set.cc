@@ -1,5 +1,5 @@
 // This file is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This program is free software: you can redistribute it and/or modify it
 // under the terms of the GNU General Public License as published by the Free
@@ -16,6 +16,8 @@
 
 #include "plink2_set.h"
 
+#include "plink2_compress_stream.h"
+
 #include <string.h>
 
 #include "include/plink2_bits.h"
@@ -23,6 +25,7 @@
 #include "include/plink2_string.h"
 #include "include/plink2_text.h"
 #include "plink2_cmdline.h"
+#include "plink2_compress_stream.h"
 #include "plink2_decompress.h"
 
 #ifdef __cplusplus
@@ -36,13 +39,16 @@ typedef struct MakeSetRangeStruct {
   uint32_t uidx_end;
 } MakeSetRange;
 
-PglErr LoadIntervalBed(const ChrInfo* cip, const uint32_t* variant_bps, const char* sorted_subset_ids, const char* file_descrip, uint32_t zero_based, uint32_t track_set_names, uint32_t border_extend, uint32_t fail_on_no_sets, uint32_t c_prefix, uintptr_t subset_ct, uintptr_t max_subset_id_blen, TextStream* txsp, uintptr_t* set_ct_ptr, char** set_names_ptr, uintptr_t* max_set_id_blen_ptr, uint64_t** range_sort_buf_ptr, MakeSetRange*** make_set_range_arr_ptr) {
+PglErr LoadIntervalBed(const ChrInfo* cip, const uint32_t* variant_bps, const char* sorted_subset_ids, const char* file_descrip, uint32_t zero_based, uint32_t track_set_names, uint32_t border_extend, uint32_t fail_on_no_sets, uint32_t c_prefix, uint32_t collapse_group, uintptr_t subset_ct, uintptr_t max_subset_id_blen, TextStream* txsp, uintptr_t* set_ct_ptr, char** set_names_ptr, uintptr_t* max_set_id_blen_ptr, uint64_t** range_sort_buf_ptr, MakeSetRange*** make_set_range_arr_ptr) {
   // In plink 1.9, this was named load_range_list() and called directly by
   // ExtractExcludeRange(), define_sets(), and indirectly by annotate(),
   // gene_report(), and clump_reports().  That function required set IDs in
   // column 4, and interpreted column 5 as a set "group label".
   // However, column 5 wasn't used very often, and without it, we're free to
-  // generalize this function to point at UCSC interval-BED files.
+  // generalize this function to point at UCSC interval-BED files; it is only
+  // read when collapse_group is set, which is --make-set-collapse-group and
+  // --make-set-complement-group.  (collapse_group requires track_set_names,
+  // and is only supported with variant_bps.)
   //
   // Assumes caller will reset g_bigstack_end later.
   PglErr reterr = kPglRetSuccess;
@@ -59,6 +65,9 @@ PglErr LoadIntervalBed(const ChrInfo* cip, const uint32_t* variant_bps, const ch
         char* first_token_end = CurTokenEnd(line_start);
         char* cur_set_id = NextTokenMult(first_token_end, 3);
         char* last_token = cur_set_id;
+        if (collapse_group && (!NoMoreTokensKns(cur_set_id))) {
+          last_token = NextToken(cur_set_id);
+        }
         if (unlikely(NoMoreTokensKns(last_token))) {
           snprintf(g_logbuf, kLogbufSize, "Error: Line %" PRIuPTR " of %s has fewer tokens than expected.\n", line_idx, file_descrip);
           goto LoadIntervalBed_ret_MALFORMED_INPUT_WW;
@@ -78,12 +87,15 @@ PglErr LoadIntervalBed(const ChrInfo* cip, const uint32_t* variant_bps, const ch
           goto LoadIntervalBed_ret_MALFORMED_INPUT_WW;
         }
         // chr_mask check removed, we want to track empty sets
-        uint32_t set_id_slen = strlen_se(cur_set_id);
+        const uint32_t cur_set_id_slen = strlen_se(cur_set_id);
+        // the set name is the group label when grouping, the set ID otherwise
+        const uint32_t name_slen = collapse_group? strlen_se(last_token) : cur_set_id_slen;
         // we're about to possibly clobber \n, so advance line_iter now
-        line_iter = AdvPastDelim(&(cur_set_id[set_id_slen]), '\n');
-        cur_set_id[set_id_slen] = '\0';
+        line_iter = AdvPastDelim(&(last_token[name_slen]), '\n');
+        last_token[name_slen] = '\0';
+        cur_set_id[cur_set_id_slen] = '\0';
         if (subset_ct) {
-          if (bsearch_strbox(cur_set_id, sorted_subset_ids, set_id_slen, max_subset_id_blen, subset_ct) == -1) {
+          if (bsearch_strbox(cur_set_id, sorted_subset_ids, cur_set_id_slen, max_subset_id_blen, subset_ct) == -1) {
             continue;
           }
         }
@@ -91,7 +103,7 @@ PglErr LoadIntervalBed(const ChrInfo* cip, const uint32_t* variant_bps, const ch
         if (make_set_ll && strequal_overread(make_set_ll->str, last_token)) {
           continue;
         }
-        uint32_t set_id_blen = set_id_slen + 1;
+        uint32_t set_id_blen = name_slen + 1;
         // argh, --clump counts positional overlaps which don't include any
         // variants in the dataset.  So we prefix set IDs with a chromosome
         // index in that case (with leading zeroes) and treat cross-chromosome
@@ -199,7 +211,11 @@ PglErr LoadIntervalBed(const ChrInfo* cip, const uint32_t* variant_bps, const ch
       char* line_start = line_iter;
       char* first_token_end = CurTokenEnd(line_start);
       char* last_token = NextTokenMult(first_token_end, 2 + track_set_names);
-      if (unlikely(NoMoreTokensKns(last_token))) {
+      char* name_token = last_token;
+      if (collapse_group && (!NoMoreTokensKns(last_token))) {
+        name_token = NextToken(last_token);
+      }
+      if (unlikely(NoMoreTokensKns(name_token))) {
         snprintf(g_logbuf, kLogbufSize, "Error: Line %" PRIuPTR " of %s has fewer tokens than expected.\n", line_idx, file_descrip);
         goto LoadIntervalBed_ret_MALFORMED_INPUT_WW;
       }
@@ -213,7 +229,7 @@ PglErr LoadIntervalBed(const ChrInfo* cip, const uint32_t* variant_bps, const ch
         snprintf(g_logbuf, kLogbufSize, "Error: Invalid chromosome code on line %" PRIuPTR " of %s.\n", line_idx, file_descrip);
         goto LoadIntervalBed_ret_MALFORMED_INPUT_WW;
       }
-      line_iter = CurTokenEnd(last_token);
+      line_iter = CurTokenEnd(name_token);
       if (!IsSet(cip->chr_mask, cur_chr_code)) {
         continue;
       }
@@ -251,23 +267,25 @@ PglErr LoadIntervalBed(const ChrInfo* cip, const uint32_t* variant_bps, const ch
         range_first -= border_extend;
       }
       range_last += border_extend;
-      const uint32_t last_token_slen = line_iter - last_token;
+      const uint32_t name_token_slen = line_iter - name_token;
       // about to potentially clobber \n, advance now
       line_iter = AdvToDelim(line_iter, '\n');
       uint32_t cur_set_idx = 0;
       if (set_ct > 1) {
         // bugfix: bsearch_strbox_natural requires null-terminated string
-        last_token[last_token_slen] = '\0';
+        name_token[name_token_slen] = '\0';
         if (c_prefix) {
-          last_token = &(last_token[-2]);
-          memcpy_k(last_token, "C_", 2);
+          // the two bytes before the name are the tail of a token we are done
+          // with, or whitespace
+          name_token = &(name_token[-2]);
+          memcpy_k(name_token, "C_", 2);
         } else if (!variant_bps) {
-          last_token = &(last_token[-S_CAST(int32_t, kMaxChrCodeDigits)]);
-          u32toa_zchr(cur_chr_code, last_token);
-          last_token[kMaxChrCodeDigits - 1] -= 15;
+          name_token = &(name_token[-S_CAST(int32_t, kMaxChrCodeDigits)]);
+          u32toa_zchr(cur_chr_code, name_token);
+          name_token[kMaxChrCodeDigits - 1] -= 15;
         }
         // this should never fail
-        cur_set_idx = bsearch_strbox_natural(last_token, set_names, max_set_id_blen, set_ct);
+        cur_set_idx = bsearch_strbox_natural(name_token, set_names, max_set_id_blen, set_ct);
       }
       if (variant_bps) {
         // translate to within-chromosome uidx
@@ -381,7 +399,7 @@ PglErr ExtractExcludeRange(const char* fnames, const ChrInfo* cip, const uint32_
         fname_txs = fnames_iter;
       }
       MakeSetRange** range_arr = nullptr;
-      reterr = LoadIntervalBed(cip, variant_bps, nullptr, fname_txs, zero_based, 0, bed_border_bp, 0, 0, 0, 0, &txs, nullptr, nullptr, nullptr, nullptr, &range_arr);
+      reterr = LoadIntervalBed(cip, variant_bps, nullptr, fname_txs, zero_based, 0, bed_border_bp, 0, 0, 0, 0, 0, &txs, nullptr, nullptr, nullptr, nullptr, &range_arr);
       if (unlikely(reterr)) {
         goto ExtractExcludeRange_ret_1;
       }
@@ -492,6 +510,960 @@ uint32_t IntervalInSetdef(const uint32_t* setdef, uint32_t variant_uidx_start, u
   return (first_hit < idx_end);
 }
 
+void InitSet(SetInfo* sip) {
+  sip->fname = nullptr;
+  sip->subset_fname = nullptr;
+  sip->setnames_flattened = nullptr;
+  sip->genekeep_flattened = nullptr;
+  sip->merged_set_name = nullptr;
+  sip->make_set_border = 0;
+  sip->flags = kfSet0;
+}
+
+void CleanupSet(SetInfo* sip) {
+  free_cond(sip->fname);
+  free_cond(sip->subset_fname);
+  free_cond(sip->setnames_flattened);
+  free_cond(sip->genekeep_flattened);
+  free_cond(sip->merged_set_name);
+}
+
+uint32_t InSetdef(const uint32_t* setdef, uint32_t variant_idx) {
+  const uint32_t range_ct = setdef[0];
+  if (range_ct != UINT32_MAX) {
+    for (uint32_t range_idx = 0; range_idx != range_ct; ++range_idx) {
+      const uint32_t range_start = setdef[range_idx * 2 + 1];
+      if (variant_idx < range_start) {
+        return 0;
+      }
+      if (variant_idx < setdef[range_idx * 2 + 2]) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  const uint32_t offset = setdef[1];
+  const uint32_t bit_ct = setdef[2];
+  if ((variant_idx < offset) || (variant_idx >= offset + bit_ct)) {
+    return setdef[3];
+  }
+  return IsSet(R_CAST(const uintptr_t*, &(setdef[4])), variant_idx - offset);
+}
+
+uint32_t SetdefSize(const uint32_t* setdef, uint32_t variant_ct) {
+  const uint32_t range_ct = setdef[0];
+  if (range_ct != UINT32_MAX) {
+    uint32_t total = 0;
+    for (uint32_t range_idx = 0; range_idx != range_ct; ++range_idx) {
+      total += setdef[range_idx * 2 + 2] - setdef[range_idx * 2 + 1];
+    }
+    return total;
+  }
+  const uint32_t offset = setdef[1];
+  const uint32_t bit_ct = setdef[2];
+  uint32_t total = PopcountWords(R_CAST(const uintptr_t*, &(setdef[4])), BitCtToWordCt(bit_ct));
+  if (setdef[3]) {
+    total += offset + (variant_ct - MINV(variant_ct, offset + bit_ct));
+  }
+  return total;
+}
+
+void UnpackSetdef(const uint32_t* setdef, uint32_t variant_ct, uintptr_t* include_bitvec) {
+  const uint32_t variant_ctl = BitCtToWordCt(variant_ct);
+  const uint32_t range_ct = setdef[0];
+  if (range_ct != UINT32_MAX) {
+    ZeroWArr(variant_ctl, include_bitvec);
+    for (uint32_t range_idx = 0; range_idx != range_ct; ++range_idx) {
+      const uint32_t range_start = setdef[range_idx * 2 + 1];
+      const uint32_t range_end = MINV(setdef[range_idx * 2 + 2], variant_ct);
+      if (range_end > range_start) {
+        FillBitsNz(range_start, range_end, include_bitvec);
+      }
+    }
+    return;
+  }
+  const uint32_t offset = setdef[1];
+  const uint32_t bit_ct = setdef[2];
+  if (setdef[3]) {
+    SetAllBits(variant_ct, include_bitvec);
+    if (offset < variant_ct) {
+      ClearBitsNz(offset, MINV(offset + bit_ct, variant_ct), include_bitvec);
+    }
+  } else {
+    ZeroWArr(variant_ctl, include_bitvec);
+  }
+  const uintptr_t* src = R_CAST(const uintptr_t*, &(setdef[4]));
+  const uint32_t copy_end = MINV(offset + bit_ct, variant_ct);
+  for (uint32_t variant_idx = offset; variant_idx != copy_end; ++variant_idx) {
+    if (IsSet(src, variant_idx - offset)) {
+      SetBit(variant_idx, include_bitvec);
+    }
+  }
+  ZeroTrailingBits(variant_ct, include_bitvec);
+}
+
+// Emits the smaller of the two setdef forms for one set, whose members are
+// given as a bitvector over the filtered variant space.  The range form costs
+// eight bytes per run of consecutive members, the bitfield form sixteen bytes
+// plus one bit per variant between the first and last member, so which one
+// wins depends on how localized the set is.
+//
+// member_bitvec must have a zeroed word past its variant_ct bits, so that a
+// run ending on the last variant still terminates the scan for its end.
+static uint32_t* SaveSetdef(const uintptr_t* member_bitvec, uint32_t variant_ct, unsigned char** alloc_basep, unsigned char* alloc_end) {
+  const uint32_t first_member = AdvBoundedTo1Bit(member_bitvec, 0, variant_ct);
+  uint32_t range_ct = 0;
+  uint32_t last_end = 0;
+  if (first_member != variant_ct) {
+    uint32_t range_start = first_member;
+    while (1) {
+      const uint32_t range_end = AdvTo0Bit(member_bitvec, range_start);
+      ++range_ct;
+      last_end = range_end;
+      if (range_end >= variant_ct) {
+        last_end = variant_ct;
+        break;
+      }
+      const uint32_t next_start = AdvBoundedTo1Bit(member_bitvec, range_end, variant_ct);
+      if (next_start == variant_ct) {
+        break;
+      }
+      range_start = next_start;
+    }
+  }
+  const uintptr_t range_form_size = (S_CAST(uintptr_t, range_ct) * 2 + 1) * sizeof(int32_t);
+  uintptr_t bitfield_form_size = UINTPTR_MAX;
+  uint32_t bitfield_offset = 0;
+  uint32_t bitfield_bit_ct = 0;
+  if (range_ct) {
+    // The offset is a multiple of 128, as the encoding requires.
+    bitfield_offset = first_member & (~127);
+    bitfield_bit_ct = RoundUpPow2(last_end - bitfield_offset, 128);
+    bitfield_form_size = 4 * sizeof(int32_t) + bitfield_bit_ct / CHAR_BIT;
+  }
+  if ((!range_ct) || (range_form_size <= bitfield_form_size)) {
+    const uintptr_t alloc_size = RoundUpPow2(range_form_size, 16);
+    if (S_CAST(uintptr_t, alloc_end - (*alloc_basep)) < alloc_size) {
+      return nullptr;
+    }
+    uint32_t* setdef = R_CAST(uint32_t*, *alloc_basep);
+    *alloc_basep = &((*alloc_basep)[alloc_size]);
+    setdef[0] = range_ct;
+    uint32_t* write_iter = &(setdef[1]);
+    uint32_t range_start = first_member;
+    for (uint32_t range_idx = 0; range_idx != range_ct; ++range_idx) {
+      const uint32_t range_end = MINV(AdvTo0Bit(member_bitvec, range_start), variant_ct);
+      *write_iter++ = range_start;
+      *write_iter++ = range_end;
+      if (range_end == variant_ct) {
+        break;
+      }
+      range_start = AdvBoundedTo1Bit(member_bitvec, range_end, variant_ct);
+    }
+    return setdef;
+  }
+  const uintptr_t alloc_size = RoundUpPow2(bitfield_form_size, 16);
+  if (S_CAST(uintptr_t, alloc_end - (*alloc_basep)) < alloc_size) {
+    return nullptr;
+  }
+  uint32_t* setdef = R_CAST(uint32_t*, *alloc_basep);
+  *alloc_basep = &((*alloc_basep)[alloc_size]);
+  setdef[0] = UINT32_MAX;
+  setdef[1] = bitfield_offset;
+  setdef[2] = bitfield_bit_ct;
+  setdef[3] = 0;
+  uintptr_t* dst = R_CAST(uintptr_t*, &(setdef[4]));
+  const uint32_t dst_word_ct = bitfield_bit_ct / kBitsPerWord;
+  ZeroWArr(dst_word_ct, dst);
+  for (uint32_t variant_idx = first_member; variant_idx != last_end; ++variant_idx) {
+    if (IsSet(member_bitvec, variant_idx)) {
+      SetBit(variant_idx - bitfield_offset, dst);
+    }
+  }
+  return setdef;
+}
+
+// True if a set with this name is wanted, given the sorted --subset/--set-names
+// list (an empty list means every set is wanted).
+static uint32_t SetNameWanted(const char* name, uint32_t name_slen, const char* sorted_subset_ids, uintptr_t subset_ct, uintptr_t max_subset_id_blen) {
+  if (!subset_ct) {
+    return 1;
+  }
+  return (bsearch_strbox(name, sorted_subset_ids, name_slen, max_subset_id_blen, subset_ct) != -1);
+}
+
+// --subset names sets in a file, --set-names on the command line; either way
+// the result is one sorted, deduplicated list.  Allocated at the end of the
+// arena, since it is only needed while the set file is being read.
+static PglErr LoadSubsetIds(const char* subset_fname, const char* setnames_flattened, uint32_t max_thread_ct, char** sorted_subset_ids_ptr, uintptr_t* subset_ct_ptr, uintptr_t* max_subset_id_blen_ptr) {
+  PglErr reterr = kPglRetSuccess;
+  TokenStream tks;
+  PreinitTokenStream(&tks);
+  {
+    LlStr* id_ll = nullptr;
+    uintptr_t id_ct = 0;
+    uintptr_t max_id_blen = 0;
+    if (subset_fname) {
+      reterr = InitTokenStream(subset_fname, MAXV(max_thread_ct - 1, 1), &tks);
+      if (unlikely(reterr)) {
+        goto LoadSubsetIds_ret_TKSTREAM_FAIL;
+      }
+      while (1) {
+        char* shard_boundaries[2];
+        reterr = TksNext(&tks, 1, shard_boundaries);
+        if (reterr) {
+          break;
+        }
+        char* shard_iter = shard_boundaries[0];
+        char* shard_end = shard_boundaries[1];
+        while (1) {
+          shard_iter = FirstPostspaceBounded(shard_iter, shard_end);
+          if (shard_iter == shard_end) {
+            break;
+          }
+          char* token_end = CurTokenEnd(shard_iter);
+          const uint32_t token_slen = token_end - shard_iter;
+          if (unlikely(token_slen >= kMaxIdSlen)) {
+            logerrputs("Error: Set IDs are limited to " MAX_ID_SLEN_STR " characters.\n");
+            goto LoadSubsetIds_ret_MALFORMED_INPUT;
+          }
+          LlStr* ll_tmp;
+          if (unlikely(bigstack_end_alloc_llstr(token_slen + 1, &ll_tmp))) {
+            goto LoadSubsetIds_ret_NOMEM;
+          }
+          ll_tmp->next = id_ll;
+          memcpyx(ll_tmp->str, shard_iter, token_slen, '\0');
+          id_ll = ll_tmp;
+          ++id_ct;
+          if (token_slen >= max_id_blen) {
+            max_id_blen = token_slen + 1;
+          }
+          shard_iter = token_end;
+        }
+      }
+      if (unlikely(reterr != kPglRetEof)) {
+        goto LoadSubsetIds_ret_TKSTREAM_FAIL;
+      }
+      reterr = kPglRetSuccess;
+      if (CleanupTokenStream3(subset_fname, &tks, &reterr)) {
+        goto LoadSubsetIds_ret_1;
+      }
+    }
+    uintptr_t cmdline_name_ct = 0;
+    if (setnames_flattened) {
+      const char* name_iter = setnames_flattened;
+      while (*name_iter) {
+        const uintptr_t cur_blen = strlen(name_iter) + 1;
+        if (unlikely(cur_blen > kMaxIdBlen)) {
+          logerrputs("Error: Set IDs are limited to " MAX_ID_SLEN_STR " characters.\n");
+          goto LoadSubsetIds_ret_MALFORMED_INPUT;
+        }
+        if (cur_blen > max_id_blen) {
+          max_id_blen = cur_blen;
+        }
+        ++cmdline_name_ct;
+        name_iter = &(name_iter[cur_blen]);
+      }
+    }
+    const uintptr_t total_id_ct = id_ct + cmdline_name_ct;
+    if (!total_id_ct) {
+      *subset_ct_ptr = 0;
+      goto LoadSubsetIds_ret_1;
+    }
+    const char** strptr_arr;
+    char* sorted_subset_ids;
+    if (unlikely(bigstack_end_alloc_kcp(total_id_ct, &strptr_arr) ||
+                 bigstack_end_alloc_c(total_id_ct * max_id_blen, &sorted_subset_ids))) {
+      goto LoadSubsetIds_ret_NOMEM;
+    }
+    for (uintptr_t ulii = 0; ulii != id_ct; ++ulii) {
+      strptr_arr[ulii] = id_ll->str;
+      id_ll = id_ll->next;
+    }
+    {
+      const char* name_iter = setnames_flattened;
+      for (uintptr_t ulii = id_ct; ulii != total_id_ct; ++ulii) {
+        strptr_arr[ulii] = name_iter;
+        name_iter = &(name_iter[strlen(name_iter) + 1]);
+      }
+    }
+    StrptrArrSort(total_id_ct, strptr_arr);
+    *subset_ct_ptr = CopyAndDedupSortedStrptrsToStrbox(strptr_arr, total_id_ct, max_id_blen, sorted_subset_ids);
+    *sorted_subset_ids_ptr = sorted_subset_ids;
+    *max_subset_id_blen_ptr = max_id_blen;
+  }
+  while (0) {
+  LoadSubsetIds_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  LoadSubsetIds_ret_TKSTREAM_FAIL:
+    TokenStreamErrPrint(subset_fname, &tks);
+    reterr = TokenStreamErrcode(&tks);
+    break;
+  LoadSubsetIds_ret_MALFORMED_INPUT:
+    reterr = kPglRetMalformedInput;
+    break;
+  }
+ LoadSubsetIds_ret_1:
+  if (subset_fname) {
+    CleanupTokenStream2(subset_fname, &tks, &reterr);
+  }
+  return reterr;
+}
+
+// Turns one set's member bitvector into a setdef, inverting it first when
+// --complement-sets is in effect.  member_bitvec is left zeroed.
+static uint32_t* SaveSetdefAndClear(uint32_t variant_ct, uint32_t complement_sets, uintptr_t* member_bitvec, unsigned char** alloc_basep, unsigned char* alloc_end) {
+  const uint32_t variant_ctl = BitCtToWordCt(variant_ct);
+  if (complement_sets) {
+    BitvecInvert(variant_ctl, member_bitvec);
+    ZeroTrailingBits(variant_ct, member_bitvec);
+  }
+  uint32_t* setdef = SaveSetdef(member_bitvec, variant_ct, alloc_basep, alloc_end);
+  ZeroWArr(variant_ctl, member_bitvec);
+  return setdef;
+}
+
+// --set: sets are variant-ID lists.
+static PglErr DefineSetsFromIdLists(const SetInfo* sip, const uintptr_t* variant_include, const char* const* variant_ids, const char* sorted_subset_ids, uintptr_t subset_ct, uintptr_t max_subset_id_blen, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_variant_id_slen, uint32_t max_thread_ct, VariantSets* vsp) {
+  const char* fname = sip->fname;
+  PglErr reterr = kPglRetSuccess;
+  TokenStream tks;
+  PreinitTokenStream(&tks);
+  {
+    const uint32_t variant_ctl = BitCtToWordCt(variant_ct);
+    const char* merged_set_name = sip->merged_set_name;
+    const uint32_t complement_sets = (sip->flags / kfSetComplements) & 1;
+    // 0 or 2; --complement-sets renames the sets it inverts, as in PLINK 1.x.
+    const uint32_t c_prefix = 2 * ((sip->flags / kfSetCPrefix) & 1);
+
+    uint32_t* variant_id_htable;
+    uint32_t* htable_dup_base;
+    uint32_t variant_id_htable_size;
+    uint32_t dup_ct;
+    reterr = AllocAndPopulateIdHtableMt(variant_include, variant_ids, variant_ct, bigstack_left() / 8, max_thread_ct, &variant_id_htable, &htable_dup_base, &variant_id_htable_size, &dup_ct);
+    if (unlikely(reterr)) {
+      goto DefineSetsFromIdLists_ret_1;
+    }
+    unsigned char* htable_mark = g_bigstack_base;
+
+    // Variant uidxs have to be turned into filtered indexes, which is what a
+    // setdef is over.
+    const uint32_t raw_variant_ctl = BitCtToWordCt(raw_variant_ct);
+    uint32_t* variant_include_cumulative_popcounts;
+    if (unlikely(bigstack_end_alloc_u32(raw_variant_ctl, &variant_include_cumulative_popcounts))) {
+      goto DefineSetsFromIdLists_ret_NOMEM;
+    }
+    FillCumulativePopcounts(variant_include, raw_variant_ctl, variant_include_cumulative_popcounts);
+
+    reterr = InitTokenStream(fname, MAXV(max_thread_ct - 1, 1), &tks);
+    if (unlikely(reterr)) {
+      goto DefineSetsFromIdLists_ret_TKSTREAM_FAIL;
+    }
+    // Pass 1 sizes everything; pass 2 fills it.  A variant ID that is not in
+    // the current variant set is ignored, as in PLINK 1.x, and so is a set
+    // that ends up empty.
+    uintptr_t kept_set_ct = 0;
+    uintptr_t max_set_name_blen = 0;
+    uintptr_t membership_ct = 0;
+    for (uint32_t pass_idx = 0; pass_idx != 2; ++pass_idx) {
+      uint32_t* membership_offsets = nullptr;
+      uint32_t* memberships = nullptr;
+      char* set_names = nullptr;
+      if (pass_idx) {
+        if (merged_set_name) {
+          kept_set_ct = 1;
+          max_set_name_blen = strlen(merged_set_name) + 1;
+        }
+        if (unlikely(!kept_set_ct)) {
+          logerrprintfww("Error: --set file '%s' contains no set that --subset/--set-names keeps.\n", fname);
+          goto DefineSetsFromIdLists_ret_INCONSISTENT_INPUT;
+        }
+        if (unlikely(bigstack_end_alloc_u32(kept_set_ct + 1, &membership_offsets) ||
+                     bigstack_end_alloc_u32(membership_ct, &memberships) ||
+                     bigstack_end_alloc_c(kept_set_ct * max_set_name_blen, &set_names))) {
+          goto DefineSetsFromIdLists_ret_NOMEM;
+        }
+        vsp->set_names = set_names;
+        vsp->max_set_name_blen = max_set_name_blen;
+        membership_offsets[0] = 0;
+        reterr = TokenRewind(&tks);
+        if (unlikely(reterr)) {
+          goto DefineSetsFromIdLists_ret_TKSTREAM_FAIL;
+        }
+      }
+      // 0: between sets, 1: inside a set being kept, 2: inside a skipped set
+      uint32_t in_set = 0;
+      uintptr_t set_idx = 0;
+      uintptr_t cur_membership_ct = 0;
+      while (1) {
+        char* shard_boundaries[2];
+        reterr = TksNext(&tks, 1, shard_boundaries);
+        if (reterr) {
+          break;
+        }
+        char* shard_iter = shard_boundaries[0];
+        char* shard_end = shard_boundaries[1];
+        while (1) {
+          shard_iter = FirstPostspaceBounded(shard_iter, shard_end);
+          if (shard_iter == shard_end) {
+            break;
+          }
+          char* token_end = CurTokenEnd(shard_iter);
+          const uint32_t token_slen = token_end - shard_iter;
+          if ((token_slen == 3) && memequal_sk(shard_iter, "END")) {
+            if (unlikely(!in_set)) {
+              logerrprintfww("Error: Unmatched END in --set file '%s'.\n", fname);
+              goto DefineSetsFromIdLists_ret_MALFORMED_INPUT;
+            }
+            if ((in_set == 1) && (!merged_set_name)) {
+              if (!pass_idx) {
+                ++kept_set_ct;
+              } else {
+                membership_offsets[++set_idx] = cur_membership_ct;
+              }
+            }
+            in_set = 0;
+          } else if (!in_set) {
+            const char token_end_char = *token_end;
+            *token_end = '\0';
+            in_set = SetNameWanted(shard_iter, token_slen, sorted_subset_ids, subset_ct, max_subset_id_blen)? 1 : 2;
+            if ((in_set == 1) && (!merged_set_name)) {
+              if (!pass_idx) {
+                if (unlikely(token_slen + c_prefix >= kMaxIdBlen)) {
+                  logerrputs("Error: Set IDs are limited to " MAX_ID_SLEN_STR " characters.\n");
+                  goto DefineSetsFromIdLists_ret_MALFORMED_INPUT;
+                }
+                if (token_slen + c_prefix >= max_set_name_blen) {
+                  max_set_name_blen = token_slen + c_prefix + 1;
+                }
+              } else {
+                char* name_dst = &(set_names[set_idx * max_set_name_blen]);
+                if (c_prefix) {
+                  memcpy_k(name_dst, "C_", 2);
+                }
+                memcpy(&(name_dst[c_prefix]), shard_iter, token_slen + 1);
+              }
+            }
+            *token_end = token_end_char;
+          } else if (in_set == 1) {
+            const char token_end_char = *token_end;
+            *token_end = '\0';
+            uint32_t cur_llidx;
+            const uint32_t variant_uidx = VariantIdDupHtableFind(shard_iter, variant_ids, variant_id_htable, htable_dup_base, token_slen, variant_id_htable_size, max_variant_id_slen, &cur_llidx);
+            *token_end = token_end_char;
+            if (variant_uidx != UINT32_MAX) {
+              if (!pass_idx) {
+                ++membership_ct;
+              } else {
+                memberships[cur_membership_ct] = RawToSubsettedPos(variant_include, variant_include_cumulative_popcounts, variant_uidx);
+              }
+              ++cur_membership_ct;
+            }
+          }
+          shard_iter = token_end;
+        }
+      }
+      if (unlikely(reterr != kPglRetEof)) {
+        goto DefineSetsFromIdLists_ret_TKSTREAM_FAIL;
+      }
+      reterr = kPglRetSuccess;
+      if (unlikely(in_set)) {
+        logerrprintfww("Error: --set file '%s' ends in the middle of a set; every set needs a closing END.\n", fname);
+        goto DefineSetsFromIdLists_ret_MALFORMED_INPUT;
+      }
+      if (pass_idx && merged_set_name) {
+        memcpy(set_names, merged_set_name, max_set_name_blen);
+        membership_offsets[1] = cur_membership_ct;
+      }
+      if (pass_idx) {
+        // Now that the file has been read, the hash table can go, and the
+        // setdefs can take its place.
+        BigstackReset(htable_mark);
+        uintptr_t* member_bitvec;
+        if (unlikely(bigstack_end_alloc_w(variant_ctl + 1, &member_bitvec) ||
+                     bigstack_alloc_u32p(kept_set_ct, &(vsp->setdefs)))) {
+          goto DefineSetsFromIdLists_ret_NOMEM;
+        }
+        ZeroWArr(variant_ctl + 1, member_bitvec);
+        unsigned char* alloc_base = g_bigstack_base;
+        unsigned char* alloc_end = g_bigstack_end;
+        for (uintptr_t cur_set_idx = 0; cur_set_idx != kept_set_ct; ++cur_set_idx) {
+          const uint32_t offset_start = membership_offsets[cur_set_idx];
+          const uint32_t offset_end = membership_offsets[cur_set_idx + 1];
+          for (uint32_t uii = offset_start; uii != offset_end; ++uii) {
+            SetBit(memberships[uii], member_bitvec);
+          }
+          vsp->setdefs[cur_set_idx] = SaveSetdefAndClear(variant_ct, complement_sets, member_bitvec, &alloc_base, alloc_end);
+          if (unlikely(!vsp->setdefs[cur_set_idx])) {
+            goto DefineSetsFromIdLists_ret_NOMEM;
+          }
+        }
+        BigstackBaseSet(alloc_base);
+        vsp->set_ct = kept_set_ct;
+      }
+    }
+    if (CleanupTokenStream3(fname, &tks, &reterr)) {
+      goto DefineSetsFromIdLists_ret_1;
+    }
+    // The names have to outlive the temporaries above them.
+    char* set_names_final;
+    if (unlikely(bigstack_alloc_c(vsp->set_ct * vsp->max_set_name_blen, &set_names_final))) {
+      goto DefineSetsFromIdLists_ret_NOMEM;
+    }
+    memcpy(set_names_final, vsp->set_names, vsp->set_ct * vsp->max_set_name_blen);
+    vsp->set_names = set_names_final;
+  }
+  while (0) {
+  DefineSetsFromIdLists_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  DefineSetsFromIdLists_ret_TKSTREAM_FAIL:
+    TokenStreamErrPrint(fname, &tks);
+    reterr = TokenStreamErrcode(&tks);
+    break;
+  DefineSetsFromIdLists_ret_MALFORMED_INPUT:
+    reterr = kPglRetMalformedInput;
+    break;
+  DefineSetsFromIdLists_ret_INCONSISTENT_INPUT:
+    reterr = kPglRetInconsistentInput;
+    break;
+  }
+ DefineSetsFromIdLists_ret_1:
+  CleanupTokenStream2(fname, &tks, &reterr);
+  return reterr;
+}
+
+// --make-set: sets are bp ranges, which LoadIntervalBed turns into ranges of
+// variant uidxs; all that is left is to move them to the filtered variant
+// space that a setdef is over.
+static PglErr DefineSetsFromRanges(const SetInfo* sip, const ChrInfo* cip, const uintptr_t* variant_include, const uint32_t* variant_bps, const char* sorted_subset_ids, uintptr_t subset_ct, uintptr_t max_subset_id_blen, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_thread_ct, VariantSets* vsp) {
+  const char* fname = sip->fname;
+  PglErr reterr = kPglRetSuccess;
+  TextStream txs;
+  PreinitTextStream(&txs);
+  {
+    const char* merged_set_name = sip->merged_set_name;
+    const uint32_t complement_sets = (sip->flags / kfSetComplements) & 1;
+    const uint32_t c_prefix = 2 * ((sip->flags / kfSetCPrefix) & 1);
+    const uint32_t collapse_group = (sip->flags / kfSetCollapseGroup) & 1;
+    reterr = InitTextStreamEx(fname, 1, kMaxLongLine, kTextStreamBlenFast, MAXV(max_thread_ct - 1, 1), &txs);
+    if (unlikely(reterr)) {
+      goto DefineSetsFromRanges_ret_TSTREAM_FAIL;
+    }
+    uintptr_t set_ct = 0;
+    uintptr_t max_set_name_blen = 0;
+    char* set_names = nullptr;
+    MakeSetRange** make_set_range_arr = nullptr;
+    // --set-collapse-all/--make-set-complement-all merge every range into one
+    // set, so there are no names to track in that case.
+    reterr = LoadIntervalBed(cip, variant_bps, sorted_subset_ids, fname, 0, (merged_set_name == nullptr), sip->make_set_border, 0, c_prefix, collapse_group, subset_ct, max_subset_id_blen, &txs, &set_ct, &set_names, &max_set_name_blen, nullptr, &make_set_range_arr);
+    if (unlikely(reterr)) {
+      goto DefineSetsFromRanges_ret_1;
+    }
+    if (!set_ct) {
+      if (unlikely(subset_ct)) {
+        logerrprintfww("Error: --make-set file '%s' contains no set that --subset/--set-names keeps.\n", fname);
+        goto DefineSetsFromRanges_ret_INCONSISTENT_INPUT;
+      }
+      // LoadIntervalBed has already warned about the empty file.
+      vsp->set_ct = 0;
+      goto DefineSetsFromRanges_ret_1;
+    }
+    const uint32_t raw_variant_ctl = BitCtToWordCt(raw_variant_ct);
+    const uint32_t variant_ctl = BitCtToWordCt(variant_ct);
+    uint32_t* variant_include_cumulative_popcounts;
+    uintptr_t* member_bitvec;
+    if (unlikely(bigstack_end_alloc_u32(raw_variant_ctl, &variant_include_cumulative_popcounts) ||
+                 bigstack_end_alloc_w(variant_ctl + 1, &member_bitvec) ||
+                 bigstack_alloc_u32p(set_ct, &(vsp->setdefs)))) {
+      goto DefineSetsFromRanges_ret_NOMEM;
+    }
+    FillCumulativePopcounts(variant_include, raw_variant_ctl, variant_include_cumulative_popcounts);
+    ZeroWArr(variant_ctl + 1, member_bitvec);
+    unsigned char* alloc_base = g_bigstack_base;
+    unsigned char* alloc_end = g_bigstack_end;
+    for (uintptr_t set_idx = 0; set_idx != set_ct; ++set_idx) {
+      for (MakeSetRange* msr_iter = make_set_range_arr[set_idx]; msr_iter; msr_iter = msr_iter->next) {
+        const uint32_t uidx_start = msr_iter->uidx_start;
+        const uint32_t uidx_end = msr_iter->uidx_end;
+        const uint32_t idx_start = RawToSubsettedPos(variant_include, variant_include_cumulative_popcounts, uidx_start);
+        const uint32_t idx_end = (uidx_end >= raw_variant_ct)? variant_ct : RawToSubsettedPos(variant_include, variant_include_cumulative_popcounts, uidx_end);
+        // Overlapping ranges are merged by the bitvector, so they need no
+        // sorting of their own.
+        if (idx_end > idx_start) {
+          FillBitsNz(idx_start, idx_end, member_bitvec);
+        }
+      }
+      vsp->setdefs[set_idx] = SaveSetdefAndClear(variant_ct, complement_sets, member_bitvec, &alloc_base, alloc_end);
+      if (unlikely(!vsp->setdefs[set_idx])) {
+        goto DefineSetsFromRanges_ret_NOMEM;
+      }
+    }
+    BigstackBaseSet(alloc_base);
+    if (merged_set_name) {
+      max_set_name_blen = strlen(merged_set_name) + 1;
+      if (unlikely(bigstack_alloc_c(max_set_name_blen, &set_names))) {
+        goto DefineSetsFromRanges_ret_NOMEM;
+      }
+      memcpy(set_names, merged_set_name, max_set_name_blen);
+    }
+    vsp->set_ct = set_ct;
+    vsp->set_names = set_names;
+    vsp->max_set_name_blen = max_set_name_blen;
+  }
+  while (0) {
+  DefineSetsFromRanges_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  DefineSetsFromRanges_ret_TSTREAM_FAIL:
+    TextStreamErrPrint(fname, &txs);
+    break;
+  DefineSetsFromRanges_ret_INCONSISTENT_INPUT:
+    reterr = kPglRetInconsistentInput;
+    break;
+  }
+ DefineSetsFromRanges_ret_1:
+  CleanupTextStream2(fname, &txs, &reterr);
+  return reterr;
+}
+
+PglErr DefineSets(const SetInfo* sip, const ChrInfo* cip, const uintptr_t* variant_include, const uint32_t* variant_bps, const char* const* variant_ids, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_variant_id_slen, uint32_t max_thread_ct, uint32_t quiet, VariantSets* vsp) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  unsigned char* bigstack_end_mark = g_bigstack_end;
+  const uint32_t make_set = (sip->flags / kfSetMakeFromRanges) & 1;
+  PglErr reterr = kPglRetSuccess;
+  {
+    char* sorted_subset_ids = nullptr;
+    uintptr_t subset_ct = 0;
+    uintptr_t max_subset_id_blen = 0;
+    if (sip->subset_fname || sip->setnames_flattened) {
+      reterr = LoadSubsetIds(sip->subset_fname, sip->setnames_flattened, max_thread_ct, &sorted_subset_ids, &subset_ct, &max_subset_id_blen);
+      if (unlikely(reterr)) {
+        goto DefineSets_ret_1;
+      }
+      if (unlikely(!subset_ct)) {
+        // An empty list keeps nothing, which is never what the user meant.
+        logerrputs("Error: --subset file is empty.\n");
+        reterr = kPglRetInconsistentInput;
+        goto DefineSets_ret_1;
+      }
+    }
+    if (make_set) {
+      reterr = DefineSetsFromRanges(sip, cip, variant_include, variant_bps, sorted_subset_ids, subset_ct, max_subset_id_blen, raw_variant_ct, variant_ct, max_thread_ct, vsp);
+    } else {
+      reterr = DefineSetsFromIdLists(sip, variant_include, variant_ids, sorted_subset_ids, subset_ct, max_subset_id_blen, raw_variant_ct, variant_ct, max_variant_id_slen, max_thread_ct, vsp);
+    }
+    if (unlikely(reterr)) {
+      goto DefineSets_ret_1;
+    }
+    if (!quiet) {
+      const uintptr_t set_ct = vsp->set_ct;
+      uintptr_t membership_ct = 0;
+      for (uintptr_t set_idx = 0; set_idx != set_ct; ++set_idx) {
+        membership_ct += SetdefSize(vsp->setdefs[set_idx], variant_ct);
+      }
+      logprintf("--%sset: %" PRIuPTR " set%s loaded, %" PRIuPTR " membership%s in all.\n", make_set? "make-" : "", set_ct, (set_ct == 1)? "" : "s", membership_ct, (membership_ct == 1)? "" : "s");
+    }
+    bigstack_mark = g_bigstack_base;
+  }
+ DefineSets_ret_1:
+  BigstackEndReset(bigstack_end_mark);
+  BigstackReset(bigstack_mark);
+  return reterr;
+}
+
+PglErr GeneFilter(const SetInfo* sip, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, uint32_t raw_variant_ct, uint32_t max_variant_id_slen, uint32_t max_thread_ct, uintptr_t* variant_include, uint32_t* variant_ct_ptr) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  const uint32_t gene_all = (sip->flags / kfSetGeneAll) & 1;
+  PglErr reterr = kPglRetSuccess;
+  {
+    const uint32_t variant_ct = *variant_ct_ptr;
+    const uint32_t variant_ctl = BitCtToWordCt(variant_ct);
+    // The sets are built over the current variant set, so that the union
+    // below is already in the filtered index space; they are discarded on the
+    // way out, and DefineSets() rebuilds them over what survives.
+    VariantSets variant_sets;
+    variant_sets.set_ct = 0;
+    variant_sets.set_names = nullptr;
+    variant_sets.max_set_name_blen = 0;
+    variant_sets.setdefs = nullptr;
+    reterr = DefineSets(sip, cip, variant_include, variant_bps, variant_ids, raw_variant_ct, variant_ct, max_variant_id_slen, max_thread_ct, 1, &variant_sets);
+    if (unlikely(reterr)) {
+      goto GeneFilter_ret_1;
+    }
+    char* sorted_genekeep_ids = nullptr;
+    uint32_t genekeep_ct = 0;
+    uintptr_t max_genekeep_blen = 0;
+    if (!gene_all) {
+      // --gene takes the names --write-set reports, so a complemented set is
+      // named with its 'C_' prefix.
+      if (unlikely(MultistrToStrboxDedupAlloc(sip->genekeep_flattened, &sorted_genekeep_ids, &genekeep_ct, &max_genekeep_blen))) {
+        goto GeneFilter_ret_NOMEM;
+      }
+    }
+    uintptr_t* keep_bitvec;
+    uintptr_t* cur_set_bitvec;
+    if (unlikely(bigstack_calloc_w(variant_ctl, &keep_bitvec) ||
+                 bigstack_alloc_w(variant_ctl, &cur_set_bitvec))) {
+      goto GeneFilter_ret_NOMEM;
+    }
+    const uintptr_t set_ct = variant_sets.set_ct;
+    const uintptr_t max_set_name_blen = variant_sets.max_set_name_blen;
+    uint32_t matched_set_ct = 0;
+    for (uintptr_t set_idx = 0; set_idx != set_ct; ++set_idx) {
+      const char* cur_set_name = &(variant_sets.set_names[set_idx * max_set_name_blen]);
+      if (!gene_all) {
+        if (bsearch_strbox(cur_set_name, sorted_genekeep_ids, strlen(cur_set_name), max_genekeep_blen, genekeep_ct) == -1) {
+          continue;
+        }
+      }
+      ++matched_set_ct;
+      UnpackSetdef(variant_sets.setdefs[set_idx], variant_ct, cur_set_bitvec);
+      BitvecOr(cur_set_bitvec, variant_ctl, keep_bitvec);
+    }
+    if (unlikely(!matched_set_ct)) {
+      if (gene_all) {
+        logerrputs("Error: All variants excluded by --gene-all, since no sets were defined.\n");
+      } else {
+        logerrputs("Error: All variants excluded by --gene, since it matched no set.\n");
+      }
+      goto GeneFilter_ret_DEGENERATE_DATA;
+    }
+    uintptr_t variant_uidx_base = 0;
+    uintptr_t cur_bits = variant_include[0];
+    for (uint32_t variant_idx = 0; variant_idx != variant_ct; ++variant_idx) {
+      // safe to clear as we go: BitIter1() has already consumed this bit
+      const uintptr_t variant_uidx = BitIter1(variant_include, &variant_uidx_base, &cur_bits);
+      if (!IsSet(keep_bitvec, variant_idx)) {
+        ClearBit(variant_uidx, variant_include);
+      }
+    }
+    const uint32_t new_variant_ct = PopcountWords(variant_include, BitCtToWordCt(raw_variant_ct));
+    if (unlikely(!new_variant_ct)) {
+      logerrprintf("Error: All variants excluded by --gene%s.\n", gene_all? "-all" : "");
+      goto GeneFilter_ret_DEGENERATE_DATA;
+    }
+    *variant_ct_ptr = new_variant_ct;
+    logprintf("--gene%s: %u set%s matched, %u variant%s remaining.\n", gene_all? "-all" : "", matched_set_ct, (matched_set_ct == 1)? "" : "s", new_variant_ct, (new_variant_ct == 1)? "" : "s");
+  }
+  while (0) {
+  GeneFilter_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  GeneFilter_ret_DEGENERATE_DATA:
+    reterr = kPglRetDegenerateData;
+    break;
+  }
+ GeneFilter_ret_1:
+  BigstackReset(bigstack_mark);
+  return reterr;
+}
+
+PglErr WriteSetList(const VariantSets* vsp, const uintptr_t* variant_include, const char* const* variant_ids, uint32_t variant_ct, SetFlags flags, uint32_t max_thread_ct, char* outname, char* outname_end) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  char* cswritep = nullptr;
+  CompressStreamState css;
+  PglErr reterr = kPglRetSuccess;
+  PreinitCstream(&css);
+  {
+    const uint32_t output_zst = (flags / kfSetWriteListZs) & 1;
+    OutnameZstSet(".set", output_zst, outname_end);
+    const uintptr_t overflow_buf_size = kCompressStreamBlock + kMaxIdSlen + 64;
+    reterr = InitCstreamAlloc(outname, 0, output_zst, max_thread_ct, overflow_buf_size, &css, &cswritep);
+    if (unlikely(reterr)) {
+      goto WriteSetList_ret_1;
+    }
+    const uint32_t variant_ctl = BitCtToWordCt(variant_ct);
+    uintptr_t* member_bitvec;
+    uint32_t* variant_idx_to_uidx;
+    if (unlikely(bigstack_alloc_w(variant_ctl, &member_bitvec) ||
+                 bigstack_alloc_u32(variant_ct, &variant_idx_to_uidx))) {
+      goto WriteSetList_ret_NOMEM;
+    }
+    {
+      uintptr_t variant_uidx_base = 0;
+      uintptr_t variant_include_bits = variant_include[0];
+      for (uint32_t variant_idx = 0; variant_idx != variant_ct; ++variant_idx) {
+        variant_idx_to_uidx[variant_idx] = BitIter1(variant_include, &variant_uidx_base, &variant_include_bits);
+      }
+    }
+    const uintptr_t set_ct = vsp->set_ct;
+    const uintptr_t max_set_name_blen = vsp->max_set_name_blen;
+    for (uintptr_t set_idx = 0; set_idx != set_ct; ++set_idx) {
+      cswritep = strcpya(cswritep, &(vsp->set_names[set_idx * max_set_name_blen]));
+      AppendBinaryEoln(&cswritep);
+      UnpackSetdef(vsp->setdefs[set_idx], variant_ct, member_bitvec);
+      uintptr_t variant_idx_base = 0;
+      uintptr_t member_bits = member_bitvec[0];
+      const uint32_t cur_member_ct = PopcountWords(member_bitvec, variant_ctl);
+      for (uint32_t uii = 0; uii != cur_member_ct; ++uii) {
+        const uintptr_t variant_idx = BitIter1(member_bitvec, &variant_idx_base, &member_bits);
+        cswritep = strcpya(cswritep, variant_ids[variant_idx_to_uidx[variant_idx]]);
+        AppendBinaryEoln(&cswritep);
+        if (unlikely(Cswrite(&css, &cswritep))) {
+          goto WriteSetList_ret_WRITE_FAIL;
+        }
+      }
+      cswritep = strcpya_k(cswritep, "END");
+      AppendBinaryEoln(&cswritep);
+      AppendBinaryEoln(&cswritep);
+      if (unlikely(Cswrite(&css, &cswritep))) {
+        goto WriteSetList_ret_WRITE_FAIL;
+      }
+    }
+    if (unlikely(CswriteCloseNull(&css, cswritep))) {
+      goto WriteSetList_ret_WRITE_FAIL;
+    }
+    logprintfww("--write-set: %" PRIuPTR " set%s written to %s .\n", set_ct, (set_ct == 1)? "" : "s", outname);
+  }
+  while (0) {
+  WriteSetList_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  WriteSetList_ret_WRITE_FAIL:
+    reterr = kPglRetWriteFail;
+    break;
+  }
+ WriteSetList_ret_1:
+  CswriteCloseCond(&css, cswritep);
+  BigstackReset(bigstack_mark);
+  return reterr;
+}
+
+// Membership of variant_idx, plus the first index after it at which membership
+// can change.  *range_idxp is this set's cursor into the range form, and must
+// start at zero and only be reused for increasing variant_idx.
+static uint32_t SetdefMembershipRun(const uint32_t* setdef, uint32_t variant_ct, uint32_t variant_idx, uint32_t* range_idxp, uint32_t* next_change_idxp) {
+  const uint32_t range_ct = setdef[0];
+  if (range_ct != UINT32_MAX) {
+    uint32_t range_idx = *range_idxp;
+    while ((range_idx != range_ct) && (setdef[range_idx * 2 + 2] <= variant_idx)) {
+      ++range_idx;
+    }
+    *range_idxp = range_idx;
+    if (range_idx == range_ct) {
+      *next_change_idxp = variant_ct;
+      return 0;
+    }
+    const uint32_t range_start = setdef[range_idx * 2 + 1];
+    if (variant_idx < range_start) {
+      *next_change_idxp = range_start;
+      return 0;
+    }
+    *next_change_idxp = setdef[range_idx * 2 + 2];
+    return 1;
+  }
+  const uint32_t offset = setdef[1];
+  const uint32_t bit_ct = setdef[2];
+  const uint32_t outer_val = setdef[3];
+  if (variant_idx < offset) {
+    *next_change_idxp = offset;
+    return outer_val;
+  }
+  if (variant_idx >= offset + bit_ct) {
+    *next_change_idxp = variant_ct;
+    return outer_val;
+  }
+  const uintptr_t* bitvec = R_CAST(const uintptr_t*, &(setdef[4]));
+  const uint32_t bit_idx = variant_idx - offset;
+  if (IsSet(bitvec, bit_idx)) {
+    *next_change_idxp = offset + AdvBoundedTo0Bit(bitvec, bit_idx, bit_ct);
+    return 1;
+  }
+  *next_change_idxp = offset + AdvBoundedTo1Bit(bitvec, bit_idx, bit_ct);
+  return 0;
+}
+
+PglErr WriteSetTable(const VariantSets* vsp, const uintptr_t* variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, uint32_t variant_ct, SetFlags flags, uint32_t max_thread_ct, char* outname, char* outname_end) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  char* cswritep = nullptr;
+  CompressStreamState css;
+  PglErr reterr = kPglRetSuccess;
+  PreinitCstream(&css);
+  {
+    const uintptr_t set_ct = vsp->set_ct;
+    const uintptr_t max_set_name_blen = vsp->max_set_name_blen;
+    const uint32_t output_zst = (flags / kfSetWriteTableZs) & 1;
+    OutnameZstSet(".set.table", output_zst, outname_end);
+    // A variant line is an ID, a chromosome code, a position, and two
+    // characters per set; the header line is flushed one set name at a time.
+    const uintptr_t overflow_buf_size = kCompressStreamBlock + 2 * kMaxIdSlen + 64 + 2 * set_ct;
+    reterr = InitCstreamAlloc(outname, 0, output_zst, max_thread_ct, overflow_buf_size, &css, &cswritep);
+    if (unlikely(reterr)) {
+      goto WriteSetTable_ret_1;
+    }
+    const uint32_t max_chr_blen = GetMaxChrSlen(cip) + 1;
+    uint32_t* range_idxs;
+    uint32_t* next_change_idxs;
+    unsigned char* cur_vals;
+    char* chr_buf;
+    if (unlikely(bigstack_calloc_u32(set_ct, &range_idxs) ||
+                 bigstack_calloc_u32(set_ct, &next_change_idxs) ||
+                 bigstack_calloc_uc(set_ct, &cur_vals) ||
+                 bigstack_alloc_c(max_chr_blen, &chr_buf))) {
+      goto WriteSetTable_ret_NOMEM;
+    }
+    cswritep = strcpya_k(cswritep, "#CHROM\tPOS\tID");
+    for (uintptr_t set_idx = 0; set_idx != set_ct; ++set_idx) {
+      *cswritep++ = '\t';
+      cswritep = strcpya(cswritep, &(vsp->set_names[set_idx * max_set_name_blen]));
+      if (unlikely(Cswrite(&css, &cswritep))) {
+        goto WriteSetTable_ret_WRITE_FAIL;
+      }
+    }
+    AppendBinaryEoln(&cswritep);
+    uintptr_t variant_uidx_base = 0;
+    uintptr_t cur_bits = variant_include[0];
+    uint32_t chr_fo_idx = UINT32_MAX;
+    uint32_t chr_end = 0;
+    uint32_t chr_buf_blen = 0;
+    for (uint32_t variant_idx = 0; variant_idx != variant_ct; ++variant_idx) {
+      const uint32_t variant_uidx = BitIter1(variant_include, &variant_uidx_base, &cur_bits);
+      if (variant_uidx >= chr_end) {
+        do {
+          ++chr_fo_idx;
+          chr_end = cip->chr_fo_vidx_start[chr_fo_idx + 1];
+        } while (variant_uidx >= chr_end);
+        const uint32_t chr_idx = cip->chr_file_order[chr_fo_idx];
+        char* chr_name_end = chrtoa(cip, chr_idx, chr_buf);
+        chr_buf_blen = chr_name_end - chr_buf;
+      }
+      cswritep = memcpya(cswritep, chr_buf, chr_buf_blen);
+      *cswritep++ = '\t';
+      cswritep = u32toa_x(variant_bps[variant_uidx], '\t', cswritep);
+      cswritep = strcpya(cswritep, variant_ids[variant_uidx]);
+      for (uintptr_t set_idx = 0; set_idx != set_ct; ++set_idx) {
+        if (next_change_idxs[set_idx] == variant_idx) {
+          cur_vals[set_idx] = SetdefMembershipRun(vsp->setdefs[set_idx], variant_ct, variant_idx, &(range_idxs[set_idx]), &(next_change_idxs[set_idx]));
+        }
+        *cswritep++ = '\t';
+        *cswritep++ = '0' + cur_vals[set_idx];
+      }
+      AppendBinaryEoln(&cswritep);
+      if (unlikely(Cswrite(&css, &cswritep))) {
+        goto WriteSetTable_ret_WRITE_FAIL;
+      }
+    }
+    if (unlikely(CswriteCloseNull(&css, cswritep))) {
+      goto WriteSetTable_ret_WRITE_FAIL;
+    }
+    logprintfww("--set-table: %" PRIuPTR " set%s written to %s .\n", set_ct, (set_ct == 1)? "" : "s", outname);
+  }
+  while (0) {
+  WriteSetTable_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  WriteSetTable_ret_WRITE_FAIL:
+    reterr = kPglRetWriteFail;
+    break;
+  }
+ WriteSetTable_ret_1:
+  CswriteCloseCond(&css, cswritep);
+  BigstackReset(bigstack_mark);
+  return reterr;
+}
+
 PglErr LoadAndSortIntervalBed(const char* fname, const ChrInfo* cip, const char* sorted_subset_ids, uint32_t zero_based, uint32_t border_extend, uintptr_t subset_ct, uintptr_t max_subset_id_blen, uint32_t max_thread_ct, uintptr_t* gene_ct_ptr, char** gene_names_ptr, uintptr_t* max_gene_id_blen_ptr, uintptr_t** chr_bounds_ptr, uint32_t*** genedefs_ptr, uintptr_t* chr_max_gene_ct_ptr) {
   // --clump-range[0]; in plink 1.9, also --annotate and --gene-report
   unsigned char* bigstack_end_mark = g_bigstack_end;
@@ -507,7 +1479,7 @@ PglErr LoadAndSortIntervalBed(const char* fname, const ChrInfo* cip, const char*
     uintptr_t max_gene_id_blen = 0;
     uint64_t* range_sort_buf;
     MakeSetRange** gene_arr;
-    reterr = LoadIntervalBed(cip, nullptr, sorted_subset_ids, fname, zero_based, 1, border_extend, 0, 0, subset_ct, max_subset_id_blen, &txs, &gene_ct, gene_names_ptr, &max_gene_id_blen, &range_sort_buf, &gene_arr);
+    reterr = LoadIntervalBed(cip, nullptr, sorted_subset_ids, fname, zero_based, 1, border_extend, 0, 0, 0, subset_ct, max_subset_id_blen, &txs, &gene_ct, gene_names_ptr, &max_gene_id_blen, &range_sort_buf, &gene_arr);
     if (unlikely(reterr)) {
       goto LoadAndSortIntervalBed_ret_1;
     }
@@ -634,6 +1606,548 @@ PglErr LoadAndSortIntervalBed(const char* fname, const ChrInfo* cip, const char*
  LoadAndSortIntervalBed_ret_1:
   CleanupTextStream2(fname, &txs, &reterr);
   BigstackEndReset(bigstack_end_mark);
+  return reterr;
+}
+
+void InitGeneReport(GeneReportInfo* grip) {
+  grip->report_fname = nullptr;
+  grip->glist_fname = nullptr;
+  grip->subset_fname = nullptr;
+  grip->chr_field = nullptr;
+  grip->pos_field = nullptr;
+  grip->id_field = nullptr;
+  grip->p_field = nullptr;
+  // UINT32_MAX = unset; --gene-list-border cannot exceed 0x7ffffffe.
+  grip->border = UINT32_MAX;
+  grip->flags = kfGeneReport0;
+}
+
+void CleanupGeneReport(GeneReportInfo* grip) {
+  free_cond(grip->report_fname);
+  free_cond(grip->glist_fname);
+  free_cond(grip->subset_fname);
+  free_cond(grip->chr_field);
+  free_cond(grip->pos_field);
+  free_cond(grip->id_field);
+  free_cond(grip->p_field);
+}
+
+// Loads a whitespace-delimited ID file into a strcmp-sorted, deduplicated
+// fixed-width box at the end of the bigstack, so that bsearch_strbox() works
+// on it.
+PglErr LoadSortedIdBox(const char* fname, const char* file_descrip, uint32_t max_thread_ct, char** sorted_ids_ptr, uintptr_t* id_ct_ptr, uintptr_t* max_id_blen_ptr) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  PglErr reterr = kPglRetSuccess;
+  TextStream txs;
+  PreinitTextStream(&txs);
+  {
+    reterr = SizeAndInitTextStream(fname, bigstack_left() / 4, MAXV(max_thread_ct - 1, 1), &txs);
+    if (unlikely(reterr)) {
+      goto LoadSortedIdBox_ret_TSTREAM_FAIL;
+    }
+    uintptr_t id_ct = 0;
+    uintptr_t max_id_blen = 0;
+    while (1) {
+      const char* line_iter = TextGet(&txs);
+      if (!line_iter) {
+        break;
+      }
+      while (!IsEolnKns(*line_iter)) {
+        const char* token_end = CurTokenEnd(line_iter);
+        const uintptr_t slen = token_end - line_iter;
+        if (unlikely(slen > kMaxIdSlen)) {
+          snprintf(g_logbuf, kLogbufSize, "Error: %s IDs are limited to " MAX_ID_SLEN_STR " characters.\n", file_descrip);
+          goto LoadSortedIdBox_ret_MALFORMED_INPUT_WW;
+        }
+        if (slen >= max_id_blen) {
+          max_id_blen = slen + 1;
+        }
+        ++id_ct;
+        line_iter = FirstNonTspace(token_end);
+      }
+    }
+    if (unlikely(TextStreamErrcode2(&txs, &reterr))) {
+      goto LoadSortedIdBox_ret_TSTREAM_FAIL;
+    }
+    if (unlikely(!id_ct)) {
+      snprintf(g_logbuf, kLogbufSize, "Error: %s file is empty.\n", file_descrip);
+      goto LoadSortedIdBox_ret_MALFORMED_INPUT_WW;
+    }
+    char* sorted_ids;
+    uint32_t* id_map;
+    if (unlikely(bigstack_end_alloc_c(id_ct * max_id_blen, &sorted_ids) ||
+                 bigstack_alloc_u32(id_ct, &id_map))) {
+      goto LoadSortedIdBox_ret_NOMEM;
+    }
+    reterr = TextRewind(&txs);
+    if (unlikely(reterr)) {
+      goto LoadSortedIdBox_ret_TSTREAM_FAIL;
+    }
+    uintptr_t id_idx = 0;
+    while (id_idx != id_ct) {
+      const char* line_iter = TextGet(&txs);
+      if (unlikely(!line_iter)) {
+        goto LoadSortedIdBox_ret_REWIND_FAIL;
+      }
+      while (!IsEolnKns(*line_iter)) {
+        const char* token_end = CurTokenEnd(line_iter);
+        const uintptr_t slen = token_end - line_iter;
+        if (unlikely(id_idx == id_ct)) {
+          goto LoadSortedIdBox_ret_REWIND_FAIL;
+        }
+        memcpyx(&(sorted_ids[id_idx * max_id_blen]), line_iter, slen, '\0');
+        ++id_idx;
+        line_iter = FirstNonTspace(token_end);
+      }
+    }
+    if (unlikely(SortStrboxIndexed(id_ct, max_id_blen, 0, sorted_ids, id_map))) {
+      goto LoadSortedIdBox_ret_NOMEM;
+    }
+    // Remove duplicates, so that bsearch_strbox() results are unambiguous.
+    uintptr_t write_idx = 1;
+    for (uintptr_t read_idx = 1; read_idx != id_ct; ++read_idx) {
+      const char* cur_id = &(sorted_ids[read_idx * max_id_blen]);
+      if (strequal_overread(&(sorted_ids[(write_idx - 1) * max_id_blen]), cur_id)) {
+        continue;
+      }
+      if (write_idx != read_idx) {
+        strcpy(&(sorted_ids[write_idx * max_id_blen]), cur_id);
+      }
+      ++write_idx;
+    }
+    *sorted_ids_ptr = sorted_ids;
+    *id_ct_ptr = write_idx;
+    *max_id_blen_ptr = max_id_blen;
+  }
+  while (0) {
+  LoadSortedIdBox_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  LoadSortedIdBox_ret_TSTREAM_FAIL:
+    TextStreamErrPrint(file_descrip, &txs);
+    break;
+  LoadSortedIdBox_ret_REWIND_FAIL:
+    logerrprintfww(kErrprintfRewind, file_descrip);
+    reterr = kPglRetRewindFail;
+    break;
+  LoadSortedIdBox_ret_MALFORMED_INPUT_WW:
+    WordWrapB(0);
+    logerrputsb();
+    reterr = kPglRetMalformedInput;
+    break;
+  }
+  CleanupTextStream2(file_descrip, &txs, &reterr);
+  BigstackReset(bigstack_mark);
+  return reterr;
+}
+
+// Recovers the chromosome index from the fixed-width prefix LoadIntervalBed()
+// prepends to each set name.  Mirrors the decoder in
+// LoadAndSortIntervalBed().
+uint32_t GenePrefixToChrIdx(const char* chrprefixed_gene_name) {
+  uint32_t chr_idx = 0;
+  for (uint32_t uii = 0; uii != kMaxChrCodeDigits - 1; ++uii) {
+    chr_idx += ctou32(chrprefixed_gene_name[uii]) - 48;
+    chr_idx *= 10;
+  }
+  // Last prefix character is offset by 33 instead of 48; see
+  // LoadAndSortIntervalBed().
+  return chr_idx + ctou32(chrprefixed_gene_name[kMaxChrCodeDigits - 1]) - 33;
+}
+
+// Each saved report line is stored as an 8-byte-aligned record:
+//   [0..7]: ln(p-value), or kLnPvalError when the report has no P column
+//   [8..11]: bp coordinate
+//   [12..15]: variant ID length
+//   [16..]: variant ID, not null-terminated, padded to a multiple of 8 bytes
+CONSTI32(kGeneReportRecordHeaderSize, 16);
+
+HEADER_INLINE uintptr_t GeneReportRecordSize(uintptr_t id_slen) {
+  return RoundUpPow2(kGeneReportRecordHeaderSize + id_slen, 8);
+}
+
+PglErr GeneReport(const GeneReportInfo* grip, const ChrInfo* cip, const char* extract_fnames, double ln_pfilter, double output_min_ln, uint32_t max_thread_ct, char* outname, char* outname_end) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  unsigned char* bigstack_end_mark = g_bigstack_end;
+  const char* report_fname = grip->report_fname;
+  uintptr_t line_idx = 0;
+  char* cswritep = nullptr;
+  PglErr reterr = kPglRetSuccess;
+  TextStream txs;
+  CompressStreamState css;
+  PreinitTextStream(&txs);
+  PreinitCstream(&css);
+  {
+    char* sorted_subset_ids = nullptr;
+    uintptr_t subset_ct = 0;
+    uintptr_t max_subset_id_blen = 0;
+    if (grip->subset_fname) {
+      reterr = LoadSortedIdBox(grip->subset_fname, "--gene-subset file", max_thread_ct, &sorted_subset_ids, &subset_ct, &max_subset_id_blen);
+      if (unlikely(reterr)) {
+        goto GeneReport_ret_1;
+      }
+    }
+    // The border is applied to the variant interval rather than to the gene
+    // ranges, so that the reported gene boundaries and DIST values stay
+    // relative to the unextended gene.
+    uintptr_t gene_ct;
+    char* gene_names;
+    uintptr_t max_gene_id_blen;
+    uintptr_t* chr_bounds;
+    uint32_t** genedefs;
+    uintptr_t chr_max_gene_ct;
+    reterr = LoadAndSortIntervalBed(grip->glist_fname, cip, sorted_subset_ids, (grip->flags / kfGeneReport0based) & 1, 0, subset_ct, max_subset_id_blen, max_thread_ct, &gene_ct, &gene_names, &max_gene_id_blen, &chr_bounds, &genedefs, &chr_max_gene_ct);
+    if (unlikely(reterr)) {
+      goto GeneReport_ret_1;
+    }
+    BigstackEndReset(bigstack_end_mark);
+    // --extract restricts which variants of the report are considered, as in
+    // PLINK 1.x.  There is no dataset on this code path, so it cannot go
+    // through the usual variant_include filtering and is applied to the report
+    // rows directly.  This must be loaded after the BigstackEndReset() above,
+    // since the box has to survive until the report is scanned.
+    char* sorted_extract_ids = nullptr;
+    uintptr_t extract_id_ct = 0;
+    uintptr_t max_extract_id_blen = 0;
+    if (extract_fnames) {
+      reterr = LoadSortedIdBox(extract_fnames, "--extract file", max_thread_ct, &sorted_extract_ids, &extract_id_ct, &max_extract_id_blen);
+      if (unlikely(reterr)) {
+        goto GeneReport_ret_1;
+      }
+    }
+    if (unlikely(gene_ct > 0x80000000LLU)) {
+      snprintf(g_logbuf, kLogbufSize, "Error: Too many genes in %s (--gene-report can only handle 2147483648).\n", grip->glist_fname);
+      goto GeneReport_ret_MALFORMED_INPUT_WW;
+    }
+    if (!gene_ct) {
+      logerrputs("Warning: No genes remain for --gene-report.\n");
+    }
+
+    // gene_names is sorted by (chromosome index, gene name); the output is
+    // sorted by (gene name, chromosome index), so build the remapping tables.
+    uint32_t* gene_nameidx_to_chridx;
+    uint32_t* gene_chridx_to_nameidx;
+    if (unlikely(bigstack_alloc_u32(gene_ct, &gene_nameidx_to_chridx) ||
+                 bigstack_alloc_u32(gene_ct, &gene_chridx_to_nameidx))) {
+      goto GeneReport_ret_NOMEM;
+    }
+    if (gene_ct) {
+      // Sort key: gene name, then a space, then the chromosome-index prefix.
+      const uintptr_t sort_key_blen = max_gene_id_blen + kMaxChrCodeDigits + 1;
+      char* sort_keys;
+      if (unlikely(bigstack_alloc_c(gene_ct * sort_key_blen, &sort_keys))) {
+        goto GeneReport_ret_NOMEM;
+      }
+      for (uintptr_t gene_idx = 0; gene_idx != gene_ct; ++gene_idx) {
+        const char* chrprefixed_gene_name = &(gene_names[gene_idx * max_gene_id_blen]);
+        char* key_iter = strcpyax(&(sort_keys[gene_idx * sort_key_blen]), &(chrprefixed_gene_name[kMaxChrCodeDigits]), ' ');
+        memcpyx(key_iter, chrprefixed_gene_name, kMaxChrCodeDigits, '\0');
+        gene_nameidx_to_chridx[gene_idx] = gene_idx;
+      }
+      if (unlikely(SortStrboxIndexed(gene_ct, sort_key_blen, 1, sort_keys, gene_nameidx_to_chridx))) {
+        goto GeneReport_ret_NOMEM;
+      }
+      for (uintptr_t name_idx = 0; name_idx != gene_ct; ++name_idx) {
+        gene_chridx_to_nameidx[gene_nameidx_to_chridx[name_idx]] = name_idx;
+      }
+      BigstackReset(sort_keys);
+    }
+
+    reterr = SizeAndInitTextStream(report_fname, bigstack_left() / 8, MAXV(max_thread_ct - 1, 1), &txs);
+    if (unlikely(reterr)) {
+      goto GeneReport_ret_TSTREAM_FAIL;
+    }
+    char* header_start;
+    do {
+      ++line_idx;
+      header_start = TextGet(&txs);
+      if (unlikely(!header_start)) {
+        reterr = TextStreamRawErrcode(&txs);
+        if (reterr == kPglRetEof) {
+          snprintf(g_logbuf, kLogbufSize, "Error: %s is empty.\n", report_fname);
+          goto GeneReport_ret_MALFORMED_INPUT_WW;
+        }
+        goto GeneReport_ret_TSTREAM_FAIL;
+      }
+    } while (strequal_k_unsafe(header_start, "##"));
+    if (*header_start == '#') {
+      ++header_start;
+    }
+    const GeneReportFlags flags = grip->flags;
+    // [0] = CHROM, [1] = POS, [2] = ID, [3] = P
+    const char* col_search_order[4];
+    col_search_order[0] = grip->chr_field? grip->chr_field : "CHROM\0CHR\0";
+    col_search_order[1] = grip->pos_field? grip->pos_field : "POS\0BP\0";
+    col_search_order[2] = grip->id_field? grip->id_field : "ID\0SNP\0";
+    col_search_order[3] = grip->p_field? grip->p_field : "P\0UNADJ\0";
+    uint32_t col_skips[4];
+    uint32_t col_types[4];
+    uint32_t relevant_col_ct;
+    uint32_t found_type_bitset;
+    reterr = SearchHeaderLine(header_start, col_search_order, "gene-report", 4, &relevant_col_ct, &found_type_bitset, col_skips, col_types);
+    if (unlikely(reterr)) {
+      goto GeneReport_ret_1;
+    }
+    if (unlikely((found_type_bitset & 7) != 7)) {
+      snprintf(g_logbuf, kLogbufSize, "Error: %s must have chromosome, bp coordinate, and variant ID columns.\n", report_fname);
+      goto GeneReport_ret_INCONSISTENT_INPUT_WW;
+    }
+    const uint32_t p_col_present = (found_type_bitset >> 3) & 1;
+    if (unlikely((!p_col_present) && (ln_pfilter != kLnPvalError))) {
+      snprintf(g_logbuf, kLogbufSize, "Error: --pfilter requires a p-value column in %s.\n", report_fname);
+      goto GeneReport_ret_INCONSISTENT_INPUT_WW;
+    }
+
+    // Report lines that match at least one gene are stored at the bottom of
+    // the arena (growing upwards); (gene, line) matches are stored at the top
+    // (8-byte entries, growing downwards).  A single line can match at most
+    // chr_max_gene_ct genes, so that much headroom is kept in reserve.
+    unsigned char* record_iter = g_bigstack_base;
+    uint64_t* match_list_end = R_CAST(uint64_t*, BigstackEndRoundedDown());
+    uint64_t* match_list = match_list_end;
+    const uint32_t border = (grip->border == UINT32_MAX)? 0 : grip->border;
+    uint32_t max_id_slen = 1;
+    uintptr_t saved_line_ct = 0;
+    uintptr_t skipped_chr_ct = 0;
+    while (1) {
+      ++line_idx;
+      char* line_start = TextGet(&txs);
+      if (!line_start) {
+        break;
+      }
+      const char* token_ptrs[4];
+      uint32_t token_slens[4];
+      if (unlikely(!TokenLexK0(line_start, col_types, col_skips, relevant_col_ct, token_ptrs, token_slens))) {
+        snprintf(g_logbuf, kLogbufSize, "Error: Line %" PRIuPTR " of %s has fewer tokens than expected.\n", line_idx, report_fname);
+        goto GeneReport_ret_MALFORMED_INPUT_WW;
+      }
+      const uint32_t chr_idx = GetChrCode(token_ptrs[0], cip, token_slens[0]);
+      if (IsI32Neg(chr_idx)) {
+        ++skipped_chr_ct;
+        continue;
+      }
+      if (!IsSet(cip->chr_mask, chr_idx)) {
+        continue;
+      }
+      uint32_t variant_bp;
+      if (unlikely(ScanUintDefcap(token_ptrs[1], &variant_bp))) {
+        snprintf(g_logbuf, kLogbufSize, "Error: Invalid bp coordinate on line %" PRIuPTR " of %s.\n", line_idx, report_fname);
+        goto GeneReport_ret_MALFORMED_INPUT_WW;
+      }
+      double ln_pval = kLnPvalError;
+      if (p_col_present) {
+        const char* pval_str = token_ptrs[3];
+        if (!ScantokLn(pval_str, &ln_pval)) {
+          const uint32_t pval_slen = token_slens[3];
+          if (IsNanStr(pval_str, pval_slen)) {
+            ln_pval = kLnPvalError;
+          } else if (likely(strequal_k(pval_str, "INF", pval_slen))) {
+            ln_pval = kLnNormalMin;
+          } else {
+            snprintf(g_logbuf, kLogbufSize, "Error: Invalid p-value on line %" PRIuPTR " of %s.\n", line_idx, report_fname);
+            goto GeneReport_ret_MALFORMED_INPUT_WW;
+          }
+        }
+        if (ln_pval > ln_pfilter) {
+          continue;
+        }
+      }
+      const uintptr_t id_slen = token_slens[2];
+      if (extract_id_ct && (bsearch_strbox(token_ptrs[2], sorted_extract_ids, id_slen, max_extract_id_blen, extract_id_ct) == -1)) {
+        continue;
+      }
+      const uintptr_t record_size = GeneReportRecordSize(id_slen);
+      if (unlikely(S_CAST(uintptr_t, R_CAST(unsigned char*, match_list) - record_iter) < record_size + chr_max_gene_ct * sizeof(int64_t))) {
+        goto GeneReport_ret_NOMEM;
+      }
+      const uint32_t bp_start = (variant_bp > border)? (variant_bp - border) : 0;
+      const uint32_t bp_end = (variant_bp > UINT32_MAX - border)? UINT32_MAX : (variant_bp + border);
+      const uintptr_t gene_idx_end = chr_bounds[chr_idx + 1];
+      uint64_t* match_list_stop = match_list;
+      for (uintptr_t gene_idx = chr_bounds[chr_idx]; gene_idx != gene_idx_end; ++gene_idx) {
+        if (IntervalInSetdef(genedefs[gene_idx], bp_start, bp_end)) {
+          *(--match_list) = (S_CAST(uint64_t, gene_chridx_to_nameidx[gene_idx]) << 32) | saved_line_ct;
+        }
+      }
+      if (match_list == match_list_stop) {
+        continue;
+      }
+      if (unlikely(saved_line_ct == 0x100000000LLU)) {
+        snprintf(g_logbuf, kLogbufSize, "Error: Too many matching lines in %s (--gene-report can only handle 4294967296).\n", report_fname);
+        goto GeneReport_ret_MALFORMED_INPUT_WW;
+      }
+      memcpy(record_iter, &ln_pval, sizeof(double));
+      memcpy(&(record_iter[8]), &variant_bp, sizeof(int32_t));
+      const uint32_t id_slen_u32 = id_slen;
+      memcpy(&(record_iter[12]), &id_slen_u32, sizeof(int32_t));
+      memcpy(&(record_iter[kGeneReportRecordHeaderSize]), token_ptrs[2], id_slen);
+      record_iter = &(record_iter[record_size]);
+      if (id_slen > max_id_slen) {
+        max_id_slen = id_slen;
+      }
+      ++saved_line_ct;
+    }
+    if (unlikely(TextStreamErrcode2(&txs, &reterr))) {
+      goto GeneReport_ret_TSTREAM_FAIL;
+    }
+    if (unlikely(CleanupTextStream2(report_fname, &txs, &reterr))) {
+      goto GeneReport_ret_1;
+    }
+    if (skipped_chr_ct) {
+      logerrprintfww("Warning: %" PRIuPTR " line%s in %s skipped due to unrecognized chromosome code%s.\n", skipped_chr_ct, (skipped_chr_ct == 1)? "" : "s", report_fname, (skipped_chr_ct == 1)? "" : "s");
+    }
+
+    // Saved-line index -> record lookup table, placed just below the match
+    // list since record_iter is not aligned for pointers.
+    if (unlikely(S_CAST(uintptr_t, R_CAST(unsigned char*, match_list) - record_iter) < saved_line_ct * sizeof(intptr_t))) {
+      goto GeneReport_ret_NOMEM;
+    }
+    unsigned char** line_lookup = &(R_CAST(unsigned char**, match_list)[-S_CAST(intptr_t, saved_line_ct)]);
+    {
+      unsigned char* record_scan = g_bigstack_base;
+      for (uintptr_t saved_line_idx = 0; saved_line_idx != saved_line_ct; ++saved_line_idx) {
+        line_lookup[saved_line_idx] = record_scan;
+        uint32_t id_slen;
+        memcpy(&id_slen, &(record_scan[12]), sizeof(int32_t));
+        record_scan = &(record_scan[GeneReportRecordSize(id_slen)]);
+      }
+    }
+    const uintptr_t match_ct = match_list_end - match_list;
+    STD_SORT(match_ct, u64cmp, match_list);
+    BigstackBaseSet(record_iter);
+    BigstackEndSet(line_lookup);
+
+    const uint32_t output_zst = (flags / kfGeneReportZs) & 1;
+    OutnameZstSet(".gene.report", output_zst, outname_end);
+    const uintptr_t overflow_buf_size = kCompressStreamBlock + max_gene_id_blen + max_id_slen + 256;
+    reterr = InitCstreamAlloc(outname, 0, output_zst, MAXV(max_thread_ct - 1, 1), overflow_buf_size, &css, &cswritep);
+    if (unlikely(reterr)) {
+      goto GeneReport_ret_1;
+    }
+    const uint32_t chrom_col = (flags / kfGeneReportColChrom) & 1;
+    const uint32_t genepos_col = (flags / kfGeneReportColGenepos) & 1;
+    const uint32_t genekb_col = (flags / kfGeneReportColGenekb) & 1;
+    const uint32_t dist_col = (flags / kfGeneReportColDist) & 1;
+    const uint32_t pos_col = (flags / kfGeneReportColPos) & 1;
+    const uint32_t p_col = p_col_present && ((flags / kfGeneReportColP) & 1);
+    *cswritep++ = '#';
+    cswritep = strcpya_k(cswritep, "GENE");
+    if (chrom_col) {
+      cswritep = strcpya_k(cswritep, "\tCHROM");
+    }
+    if (genepos_col) {
+      cswritep = strcpya_k(cswritep, "\tGENE_START\tGENE_END");
+    }
+    if (genekb_col) {
+      cswritep = strcpya_k(cswritep, "\tGENE_KB");
+    }
+    if (dist_col) {
+      cswritep = strcpya_k(cswritep, "\tDIST");
+    }
+    if (pos_col) {
+      cswritep = strcpya_k(cswritep, "\tPOS");
+    }
+    cswritep = strcpya_k(cswritep, "\tID");
+    if (p_col) {
+      cswritep = strcpya_k(cswritep, "\tP");
+    }
+    AppendBinaryEoln(&cswritep);
+
+    uintptr_t prev_name_idx = ~k0LU;
+    const char* cur_gene_name = nullptr;
+    uint32_t cur_gene_start = 0;
+    uint32_t cur_gene_end = 0;
+    uint32_t cur_chr_idx = 0;
+    double cur_gene_kb = 0.0;
+    for (uintptr_t match_idx = 0; match_idx != match_ct; ++match_idx) {
+      const uint64_t cur_match = match_list[match_idx];
+      const uintptr_t name_idx = cur_match >> 32;
+      if (name_idx != prev_name_idx) {
+        prev_name_idx = name_idx;
+        const uintptr_t gene_idx = gene_nameidx_to_chridx[name_idx];
+        const char* chrprefixed_gene_name = &(gene_names[gene_idx * max_gene_id_blen]);
+        cur_gene_name = &(chrprefixed_gene_name[kMaxChrCodeDigits]);
+        cur_chr_idx = GenePrefixToChrIdx(chrprefixed_gene_name);
+        const uint32_t* genedef = genedefs[gene_idx];
+        const uint32_t range_ct = genedef[0];
+        cur_gene_start = genedef[1];
+        cur_gene_end = genedef[2 * range_ct];
+        uint32_t covered_bp_ct = 0;
+        for (uint32_t range_idx = 0; range_idx != range_ct; ++range_idx) {
+          covered_bp_ct += genedef[2 * range_idx + 2] - genedef[2 * range_idx + 1];
+        }
+        cur_gene_kb = u31tod(covered_bp_ct) * 0.001;
+      }
+      const unsigned char* record = line_lookup[S_CAST(uint32_t, cur_match)];
+      double ln_pval;
+      memcpy(&ln_pval, record, sizeof(double));
+      uint32_t variant_bp;
+      memcpy(&variant_bp, &(record[8]), sizeof(int32_t));
+      uint32_t id_slen;
+      memcpy(&id_slen, &(record[12]), sizeof(int32_t));
+      cswritep = strcpya(cswritep, cur_gene_name);
+      if (chrom_col) {
+        *cswritep++ = '\t';
+        cswritep = chrtoa(cip, cur_chr_idx, cswritep);
+      }
+      if (genepos_col) {
+        *cswritep++ = '\t';
+        cswritep = u32toa_x(cur_gene_start, '\t', cswritep);
+        cswritep = u32toa(cur_gene_end - 1, cswritep);
+      }
+      if (genekb_col) {
+        *cswritep++ = '\t';
+        cswritep = dtoa_g(cur_gene_kb, cswritep);
+      }
+      if (dist_col) {
+        *cswritep++ = '\t';
+        cswritep = dtoa_g(S_CAST(double, S_CAST(int32_t, variant_bp) - S_CAST(int32_t, cur_gene_start)) * 0.001, cswritep);
+      }
+      if (pos_col) {
+        *cswritep++ = '\t';
+        cswritep = u32toa(variant_bp, cswritep);
+      }
+      *cswritep++ = '\t';
+      cswritep = memcpya(cswritep, &(record[kGeneReportRecordHeaderSize]), id_slen);
+      if (p_col) {
+        *cswritep++ = '\t';
+        cswritep = lntoa_g(MAXV(ln_pval, output_min_ln), cswritep);
+      }
+      AppendBinaryEoln(&cswritep);
+      if (unlikely(Cswrite(&css, &cswritep))) {
+        goto GeneReport_ret_WRITE_FAIL;
+      }
+    }
+    if (unlikely(CswriteCloseNull(&css, cswritep))) {
+      goto GeneReport_ret_WRITE_FAIL;
+    }
+    logprintfww("--gene-report: %" PRIuPTR " gene-variant pair%s written to %s .\n", match_ct, (match_ct == 1)? "" : "s", outname);
+  }
+  while (0) {
+  GeneReport_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  GeneReport_ret_TSTREAM_FAIL:
+    TextStreamErrPrint(report_fname, &txs);
+    break;
+  GeneReport_ret_WRITE_FAIL:
+    reterr = kPglRetWriteFail;
+    break;
+  GeneReport_ret_INCONSISTENT_INPUT_WW:
+    WordWrapB(0);
+    logerrputsb();
+    reterr = kPglRetInconsistentInput;
+    break;
+  GeneReport_ret_MALFORMED_INPUT_WW:
+    WordWrapB(0);
+    logerrputsb();
+    reterr = kPglRetMalformedInput;
+    break;
+  }
+ GeneReport_ret_1:
+  CswriteCloseCond(&css, cswritep);
+  CleanupTextStream2(report_fname, &txs, &reterr);
+  BigstackDoubleReset(bigstack_mark, bigstack_end_mark);
   return reterr;
 }
 

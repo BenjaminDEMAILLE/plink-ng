@@ -2,7 +2,7 @@
 #define __PLINK2_MATRIX_CALC_H__
 
 // This file is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This program is free software: you can redistribute it and/or modify it
 // under the terms of the GNU General Public License as published by the Free
@@ -57,8 +57,10 @@ FLAGSET_DEF_START()
   kfKingColIbs1 = (1 << 20),
   kfKingColHamming = (1 << 21),
   kfKingColKinship = (1 << 22),
+  kfKingColRt = (1 << 23),
+  kfKingColPkin = (1 << 24),
   kfKingColDefault = (kfKingColMaybefid | kfKingColId | kfKingColMaybesid | kfKingColNsnp | kfKingColHethet | kfKingColIbs0 | kfKingColKinship),
-  kfKingColAll = ((kfKingColKinship * 2) - kfKingColMaybefid)
+  kfKingColAll = ((kfKingColPkin * 2) - kfKingColMaybefid)
 FLAGSET_DEF_END(KingFlags);
 
 // --make-rel, --make-grm-list, --make-grm-bin, --make-grm-sparse
@@ -118,6 +120,32 @@ FLAGSET_DEF_START()
   kfPcaVcolDefaultB = (kfPcaVcolChrom | kfPcaVcolMaybeprovref | kfPcaVcolMaj | kfPcaVcolNonmaj),
   kfPcaVcolAll = ((kfPcaVcolNonmaj * 2) - kfPcaVcolChrom)
 FLAGSET_DEF_END(PcaFlags);
+
+FLAGSET_DEF_START()
+  kfNeighbour0,
+  kfNeighbourZs = (1 << 0),
+
+  kfNeighbourColMaybefid = (1 << 1),
+  kfNeighbourColFid = (1 << 2),
+  kfNeighbourColMaybesid = (1 << 3),
+  kfNeighbourColSid = (1 << 4),
+  kfNeighbourColDistSelf = (1 << 5),
+  kfNeighbourColDistNn = (1 << 6),
+  kfNeighbourColStat = (1 << 7),
+  kfNeighbourColDefault = (kfNeighbourColMaybefid | kfNeighbourColMaybesid | kfNeighbourColDistSelf | kfNeighbourColDistNn | kfNeighbourColStat),
+  kfNeighbourColAll = ((kfNeighbourColStat * 2) - kfNeighbourColMaybefid)
+FLAGSET_DEF_END(NeighbourFlags);
+
+typedef struct NeighbourInfoStruct {
+  NeighbourFlags flags;
+  // 0 when --neighbour was not specified
+  uint32_t nn_ct;
+} NeighbourInfo;
+
+void InitNeighbour(NeighbourInfo* neighbour_info_ptr);
+
+PglErr NeighbourFromEigvecFile(const uintptr_t* sample_include, const SampleIdInfo* siip, const char* eigvec_fname, const NeighbourInfo* neighbour_ip, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t max_thread_ct, char* outname, char* outname_end);
+
 
 FLAGSET_DEF_START()
   kfScore0,
@@ -225,7 +253,7 @@ PglErr KingCutoffBatchBinary(const SampleIdInfo* siip, uint32_t raw_sample_ct, d
 
 PglErr KingCutoffBatchTable(const SampleIdInfo* siip, const char* kin0_fname, uint32_t raw_sample_ct, double king_cutoff, uintptr_t* sample_include, uint32_t* sample_ct_ptr);
 
-PglErr CalcKing(const SampleIdInfo* siip, const uintptr_t* variant_include_orig, const ChrInfo* cip, uint32_t raw_sample_ct, uint32_t orig_sample_ct, uint32_t raw_variant_ct, uint32_t variant_ct, double king_cutoff, double king_table_filter, KingFlags king_flags, uint32_t parallel_idx, uint32_t parallel_tot, uint32_t max_thread_ct, uintptr_t pgr_alloc_cacheline_ct, PgenFileInfo* pgfip, PgenReader* simple_pgrp, uintptr_t* sample_include, uint32_t* sample_ct_ptr, char* outname, char* outname_end);
+PglErr CalcKing(const PedigreeIdInfo* piip, const uintptr_t* founder_info, const uintptr_t* variant_include_orig, const ChrInfo* cip, uint32_t raw_sample_ct, uint32_t orig_sample_ct, uint32_t raw_variant_ct, uint32_t variant_ct, double king_cutoff, double king_table_filter, KingFlags king_flags, uint32_t parallel_idx, uint32_t parallel_tot, uint32_t max_thread_ct, uintptr_t pgr_alloc_cacheline_ct, PgenFileInfo* pgfip, PgenReader* simple_pgrp, uintptr_t* sample_include, uint32_t* sample_ct_ptr, char* outname, char* outname_end);
 
 ENUM_U31_DEF_START()
   kRcCheck0,
@@ -233,12 +261,35 @@ ENUM_U31_DEF_START()
   kRcCheckConcordance
 ENUM_U31_DEF_END(RelConcordanceCheckMode);
 
-PglErr CalcKingTableSubset(const uintptr_t* orig_sample_include, const SampleIdInfo* siip, const uintptr_t* variant_include, const ChrInfo* cip, const char* subset_fname, const char* require_fnames, uint32_t raw_sample_ct, uint32_t orig_sample_ct, uint32_t raw_variant_ct, uint32_t variant_ct, double king_table_filter, double king_table_subset_thresh, RelConcordanceCheckMode rel_or_concordance_check, KingFlags king_flags, uint32_t parallel_idx, uint32_t parallel_tot, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
+PglErr CalcKingTableSubset(const uintptr_t* orig_sample_include, const PedigreeIdInfo* piip, const uintptr_t* founder_info, const uintptr_t* variant_include, const ChrInfo* cip, const char* subset_fname, const char* require_fnames, uint32_t raw_sample_ct, uint32_t orig_sample_ct, uint32_t raw_variant_ct, uint32_t variant_ct, double king_table_filter, double king_table_subset_thresh, RelConcordanceCheckMode rel_or_concordance_check, KingFlags king_flags, uint32_t parallel_idx, uint32_t parallel_tot, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
+
+// --distance, --distance-matrix, --ibs-matrix
+FLAGSET_DEF_START()
+  kfDistance0,
+  kfDistanceMatrixZs = (1 << 0),
+  kfDistanceMatrixBin = (1 << 1),
+  kfDistanceMatrixBin4 = (1 << 2),
+  kfDistanceMatrixEncodemask = (kfDistanceMatrixZs | kfDistanceMatrixBin | kfDistanceMatrixBin4),
+  kfDistanceMatrixSq = (1 << 3),
+  kfDistanceMatrixSq0 = (1 << 4),
+  kfDistanceMatrixTri = (1 << 5),
+  kfDistanceMatrixShapemask = (kfDistanceMatrixSq | kfDistanceMatrixSq0 | kfDistanceMatrixTri),
+
+  // Which of the three reports to write; more than one is allowed.
+  kfDistanceAlleleCt = (1 << 6),
+  kfDistanceIbs = (1 << 7),
+  kfDistance1MinusIbs = (1 << 8),
+  kfDistanceOutputMask = (kfDistanceAlleleCt | kfDistanceIbs | kfDistance1MinusIbs),
+
+  kfDistanceFlatMissing = (1 << 9)
+FLAGSET_DEF_END(DistanceFlags);
+
+PglErr CalcDistance(const uintptr_t* sample_include, const SampleIdInfo* siip, const uintptr_t* variant_include, const ChrInfo* cip, const uintptr_t* allele_idx_offsets, const double* allele_freqs, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t raw_variant_ct, uint32_t variant_ct, DistanceFlags flags, uint32_t parallel_idx, uint32_t parallel_tot, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);
 
 PglErr CalcGrm(const uintptr_t* orig_sample_include, const SampleIdInfo* siip, const uintptr_t* variant_include, const ChrInfo* cip, const uintptr_t* allele_idx_offsets, const double* allele_freqs, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_allele_ct, GrmFlags grm_flags, double grm_sparse_cutoff, uint32_t parallel_idx, uint32_t parallel_tot, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end, double** grm_ptr);
 
 #ifndef NOLAPACK
-PglErr CalcPca(const uintptr_t* sample_include, const SampleIdInfo* siip, const uintptr_t* variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const AlleleCode* maj_alleles, const double* allele_freqs, uint32_t raw_sample_ct, uintptr_t pca_sample_ct, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_allele_ct, uint32_t max_allele_slen, uint32_t pc_ct, PcaFlags pca_flags, uint32_t max_thread_ct, PgenReader* simple_pgrp, sfmt_t* sfmtp, double* grm, char* outname, char* outname_end);
+PglErr CalcPca(const uintptr_t* sample_include, const SampleIdInfo* siip, const uintptr_t* variant_include, const ChrInfo* cip, const uint32_t* variant_bps, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const AlleleCode* maj_alleles, const double* allele_freqs, const NeighbourInfo* neighbour_ip, uint32_t raw_sample_ct, uintptr_t pca_sample_ct, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_allele_ct, uint32_t max_allele_slen, uint32_t pc_ct, PcaFlags pca_flags, uint32_t max_thread_ct, PgenReader* simple_pgrp, sfmt_t* sfmtp, double* grm, char* outname, char* outname_end);
 #endif
 
 PglErr ScoreReport(const uintptr_t* sample_include, const SampleIdInfo* siip, const uintptr_t* sex_nm, const uintptr_t* sex_male, const PhenoCol* pheno_cols, const char* pheno_names, const uintptr_t* variant_include, const ChrInfo* cip, const char* const* variant_ids, const uintptr_t* allele_idx_offsets, const char* const* allele_storage, const double* allele_freqs, const ScoreInfo* score_info_ptr, const char* output_missing_pheno, uint32_t raw_sample_ct, uint32_t sample_ct, uint32_t nosex_ct, uint32_t pheno_ct, uintptr_t max_pheno_name_blen, uint32_t raw_variant_ct, uint32_t variant_ct, uint32_t max_variant_id_slen, uint32_t xchr_model, uint32_t max_thread_ct, PgenReader* simple_pgrp, char* outname, char* outname_end);

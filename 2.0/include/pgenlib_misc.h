@@ -2,7 +2,7 @@
 #define __PGENLIB_MISC_H__
 
 // This library is part of PLINK 2.0, copyright (C) 2005-2026 Shaun Purcell,
-// Christopher Chang.
+// Christopher Chang, Benjamin Demaille.
 //
 // This library is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by the
@@ -88,7 +88,7 @@
 // 10000 * major + 100 * minor + patch
 // Exception to CONSTI32, since we want the preprocessor to have access to this
 // value.  Named with all caps as a consequence.
-#define PGENLIB_INTERNAL_VERNUM 2100
+#define PGENLIB_INTERNAL_VERNUM 2201
 
 #ifdef __cplusplus
 namespace plink2 {
@@ -321,7 +321,12 @@ HEADER_INLINE void ZeroTrailingNyps(uintptr_t nyp_ct, uintptr_t* bitarr) {
 HEADER_INLINE void SetTrailingNyps(uintptr_t nyp_ct, uintptr_t* bitarr) {
   const uintptr_t trail_ct = nyp_ct % kBitsPerWordD2;
   if (trail_ct) {
-    bitarr[nyp_ct / kBitsPerWordD2] |= (~k0LU) << (nyp_ct * 2);
+    // Shift by trail_ct * 2, not nyp_ct * 2.  The two agree on x86-64 and
+    // ARM64, where the shift count is masked to 6 bits and (nyp_ct * 2) % 64
+    // is exactly trail_ct * 2, but a shift that wide is undefined, and it is
+    // wrong on any target that does not mask.  ZeroTrailingBits() next door
+    // already uses the remainder.
+    bitarr[nyp_ct / kBitsPerWordD2] |= (~k0LU) << (trail_ct * 2);
   }
 }
 
@@ -1103,6 +1108,12 @@ typedef struct PgenExtensionLlStruct {
   unsigned char* contents;
   uint8_t type_idx;
 } PgenExtensionLl;
+
+// Returns 1 if a dosage returned by PgrGetD()/PgrGetDp() exceeds 32768,
+// or a dphase_delta would put a haplotype dosage outside [0, 1].  The read
+// functions don't check values, since PgrValidate() does; callers that turn
+// these values into table indexes (e.g. VCF text export) should check first.
+BoolErr PglDosagesAreInvalid(const uintptr_t* __restrict dosage_present, const uint16_t* __restrict dosage_main, uint32_t dosage_ct, const uintptr_t* __restrict dphase_present, const int16_t* __restrict dphase_delta, uint32_t dphase_ct);
 
 #ifdef __cplusplus
 }  // namespace plink2
